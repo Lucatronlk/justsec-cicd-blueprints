@@ -52,12 +52,28 @@ resource "aws_s3_bucket_versioning" "sample" {
   }
 }
 
+resource "aws_kms_key" "sample" {
+  description         = "Encryption key for the sample S3 bucket"
+  enable_key_rotation = true
+  tags = {
+    owner               = "security-scans"
+    service             = "sample-infrastructure"
+    environment         = "test"
+    data-classification = "public"
+    cost-center         = "demo"
+    managed-by          = "terraform"
+    incident-contact    = "repository-maintainer"
+  }
+}
+
 resource "aws_s3_bucket_server_side_encryption_configuration" "sample" {
   bucket = aws_s3_bucket.sample.id
   rule {
     apply_server_side_encryption_by_default {
-      sse_algorithm = "AES256"
+      sse_algorithm     = "aws:kms"
+      kms_master_key_id = aws_kms_key.sample.arn
     }
+    bucket_key_enabled = true
   }
 }
 
