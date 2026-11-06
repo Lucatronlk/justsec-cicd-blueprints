@@ -1,0 +1,46 @@
+name: Sample - container web
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sample-container-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/dev-security-scan.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/container-web
+      artifact-prefix: sample-container-dev
+
+  pr:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/pr-security-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/container-web
+      artifact-prefix: sample-container-pr
+
+  image:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/image-security-scan.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      dockerfile: apps/container-web/Dockerfile
+      docker-context: apps/container-web
+      artifact-prefix: sample-container-image

@@ -1,0 +1,35 @@
+# Local Linux/amd64 scan toolbox. This file does not change GitHub Actions workflows.
+# Release archives are checksum-verified.
+# Build: docker build --platform linux/amd64 -f Dockerfile.scan-tools -t scan-tools:local .
+# Run:   docker run --rm --user "$(id -u):$(id -g)" -v "$PWD:/workspace:ro" -w /workspace scan-tools:local trivy fs .
+# Checkov/KICS/Semgrep are digest-pinned container scanners in the workflows, not binaries in this image.
+# Use a separately configured daemon to run those images; never mount a privileged host socket in untrusted CI.
+FROM --platform=linux/amd64 python:3.13-slim-bookworm
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash ca-certificates curl git jq unzip xz-utils openjdk-17-jre-headless \
+    && rm -rf /var/lib/apt/lists/*
+
+# Versions and archive SHA-256 values mirror the workflow_call defaults in .github/workflows.
+# Do not update a version without updating its digest from the matching release asset.
+RUN set -eu; \
+    fetch() { curl --fail --show-error --silent --location --retry 3 --output /tmp/scanner.download "$1"; printf '%s  /tmp/scanner.download\n' "$2" | sha256sum -c -; }; \
+    tgz() { fetch "$1" "$2"; tar -xzf /tmp/scanner.download -C /usr/local/bin "$3"; rm /tmp/scanner.download; }; \
+    raw() { fetch "$1" "$2"; install -m 0755 /tmp/scanner.download "/usr/local/bin/$3"; rm /tmp/scanner.download; }; \
+    zipbin() { fetch "$1" "$2"; unzip -oq /tmp/scanner.download "$3" -d /usr/local/bin; rm /tmp/scanner.download; }; \
+    tgz 'https://github.com/aquasecurity/trivy/releases/download/v0.75.0/trivy_0.75.0_Linux-64bit.tar.gz' 'c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f' trivy; \
+    tgz 'https://github.com/anchore/grype/releases/download/v0.119.0/grype_0.119.0_linux_amd64.tar.gz' '3fa2dc4b924621ab65404cf08d0b8438d896d80ab949c9d5a4ca283c36004c9b' grype; \
+    tgz 'https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz' '551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb' gitleaks; \
+    raw 'https://github.com/hadolint/hadolint/releases/download/v2.15.1/hadolint-linux-x86_64' 'c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507' hadolint; \
+    raw 'https://github.com/google/osv-scanner/releases/download/v2.6.0/osv-scanner_linux_amd64' 'ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108' osv-scanner; \
+    zipbin 'https://github.com/opentofu/opentofu/releases/download/v1.12.6/tofu_1.12.6_linux_amd64.zip' '5dc43da4f750f33873dc25e94587128709e819e544b7be9016b255316153c3a8' tofu; \
+    raw 'https://github.com/mvdan/sh/releases/download/v3.14.1/shfmt_v3.14.1_linux_amd64' '76e77641faa025814b77f153b29796b8e6fa2fca03e0c76a691608b86c7ea7bf' shfmt; \
+    fetch 'https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz' '8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198'; \
+    tar -xJf /tmp/scanner.download --strip-components=1 -C /usr/local/bin shellcheck-v0.11.0/shellcheck; rm /tmp/scanner.download; \
+    chmod 0755 /usr/local/bin/trivy /usr/local/bin/grype /usr/local/bin/gitleaks /usr/local/bin/tofu /usr/local/bin/shellcheck
+
+WORKDIR /workspace
+# No source code, credentials or scan results baked into image. Mount targets at runtime.
+USER 65532:65532
+CMD ["bash"]

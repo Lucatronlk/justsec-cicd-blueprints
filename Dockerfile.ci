@@ -1,0 +1,14 @@
+FROM python:3.13-slim
+
+ARG DEBIAN_FRONTEND=noninteractive
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends bash curl git jq ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /workspace
+COPY requirements-ci.txt /tmp/requirements-ci.txt
+RUN pip install --no-cache-dir -r /tmp/requirements-ci.txt
+
+COPY scripts/ /workspace/scripts/
+RUN chmod +x /workspace/scripts/ci.sh
+ENTRYPOINT ["/workspace/scripts/ci.sh"]

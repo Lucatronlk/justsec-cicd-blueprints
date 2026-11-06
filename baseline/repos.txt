@@ -1,0 +1,4 @@
+# One repository per line, owner/name. `scripts/audit_baseline.py` checks each
+# against BASELINE.md. Lines starting with # are ignored. Add a repository here
+# when it starts calling these workflows; a repository not listed is not covered.
+Lucatronlk/justsec-cicd-blueprints

@@ -1,0 +1,20 @@
+# Manual isolated install/scan probe. Existing scan profiles and their gates
+# remain unchanged. Remove this workflow when the runner is validated.
+name: Single scanner test (osv-scanner)
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  osv:
+    uses: ./.github/workflows/scan-osv-scanner.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested workflow declares the SARIF upload scope
+    with:
+      working-directory: apps/fixture
+      artifact-name: test-osv-scanner
+      upload-sarif: false

@@ -1,0 +1,12 @@
+.terraform/
+
+# Python tooling
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+
+# Other project's artwork is retained locally, but not part of this repository.
+/assets/justsec/justsec-agent-kit.svg
+/assets/justsec/justsec-agent-kit.png

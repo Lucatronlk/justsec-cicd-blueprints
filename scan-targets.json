@@ -1,0 +1,12 @@
+{
+  "targets": [
+    {"app": "python-api", "path": "apps/python-api", "kind": "sample", "dockerfile": "apps/python-api/Dockerfile", "context": "apps/python-api", "artifact-prefix": "python-api"},
+    {"app": "typescript-web", "path": "apps/typescript-web", "kind": "sample", "dockerfile": "apps/typescript-web/Dockerfile", "context": "apps/typescript-web", "artifact-prefix": "typescript-web"},
+    {"app": "dotnet-api", "path": "apps/dotnet-api", "kind": "sample", "dockerfile": "apps/dotnet-api/Dockerfile", "context": "apps/dotnet-api", "artifact-prefix": "dotnet-api"},
+    {"app": "container-web", "path": "apps/container-web", "kind": "sample", "dockerfile": "apps/container-web/Dockerfile", "context": "apps/container-web", "artifact-prefix": "container-web"},
+    {"app": "infrastructure", "path": "apps/infrastructure", "kind": "sample", "dockerfile": "apps/infrastructure/Dockerfile", "context": "apps/infrastructure", "artifact-prefix": "infrastructure"},
+    {"app": "k8s", "path": "apps/k8s", "kind": "sample", "dockerfile": "apps/k8s/Dockerfile", "context": "apps/k8s", "artifact-prefix": "k8s"},
+    {"app": "fixture", "path": "apps/fixture", "kind": "fixture", "dockerfile": "apps/fixture/Dockerfile", "context": "apps/fixture", "artifact-prefix": "fixture"},
+    {"app": "sample-app", "path": "apps/sample-app", "kind": "fixture", "dockerfile": "apps/sample-app/Dockerfile", "context": "apps/sample-app", "artifact-prefix": "sample-app"}
+  ]
+}

@@ -1,0 +1,557 @@
+# Reusable CI for a Python project: lint, a test matrix, an optional CLI smoke
+# test, a single-arch container build that is run before it is trusted, and a
+# lint of the caller's own workflow files.
+#
+# Call it from a repository with:
+#
+#   jobs:
+#     ci:
+#       uses: Lucatronlk/justsec-cicd-blueprints/.github/workflows/python-ci.yml@<sha> # vX.Y.Z
+#       permissions:
+#         contents: read
+#         id-token: write        # OIDC: the Codecov upload and the Doppler fetch
+#       secrets:
+#         DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}   # optional fallback
+#       with:
+#         python-versions: '["3.11", "3.12", "3.13"]'
+#         test-command: pytest --cov=my_pkg --cov-report=xml
+#
+# Every input has a default that matches the most common shape across the
+# calling repositories; a caller overrides only what differs. The `ci-green`
+# job at the end is the one to name in branch protection: it fails when any job
+# it needs failed, so a job added here can never merge unchecked.
+#
+# Commands a caller supplies (`lint-command`, `test-command`, ...) reach the
+# shell through an environment variable, never by template expansion into the
+# script, so a value can only ever be data.
+#
+# Secrets come from Doppler over the job's own OIDC identity; the steps are the
+# same as .github/actions/doppler-secrets, inlined so that a caller pinned to a
+# commit of this file gets exactly that commit's behaviour.
+
+name: Python CI (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      python-versions:
+        description: JSON array of Python versions for the test matrix.
+        type: string
+        default: '["3.11", "3.12", "3.13"]'
+      coverage-python-version:
+        description: The matrix leg that uploads the coverage report.
+        type: string
+        default: "3.13"
+      install-command:
+        description: Shell run before tests on every matrix leg.
+        type: string
+        default: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+      test-command:
+        description: Shell that runs the test suite.
+        type: string
+        default: pytest
+      coverage-file:
+        description: Coverage report path uploaded as an artifact when present.
+        type: string
+        default: coverage.xml
+      codecov:
+        description: Upload the coverage report to Codecov over GitHub OIDC; no Codecov token is stored anywhere. The repository must be enabled in the Codecov GitHub App.
+        type: boolean
+        default: false
+      lint-python-version:
+        description: Python used for the lint job.
+        type: string
+        default: "3.13"
+      lint-install-command:
+        description: Shell that installs the linters.
+        type: string
+        default: pip install ruff
+      lint-command:
+        description: Shell that lints. A non-zero exit fails the job unless `lint-continue-on-error` is set.
+        type: string
+        default: ruff check .
+      lint-continue-on-error:
+        description: Report lint failures without failing CI. A migration aid, not a resting state.
+        type: boolean
+        default: false
+      smoke-command:
+        description: Shell run after `smoke-install-command` on `coverage-python-version`; empty skips the job.
+        type: string
+        default: ""
+      smoke-install-command:
+        description: Shell that installs the project for the smoke test.
+        type: string
+        default: pip install .
+      docker-build:
+        description: Build the container image (single platform, never pushed).
+        type: boolean
+        default: true
+      dockerfile:
+        description: Path to the Dockerfile.
+        type: string
+        default: Dockerfile
+      docker-context:
+        description: Build context.
+        type: string
+        default: "."
+      docker-test-command:
+        description: Shell run against the built image; `$IMAGE` names it. Empty skips the check.
+        type: string
+        default: ""
+      workflow-lint:
+        description: Run actionlint and zizmor over the caller's own .github/workflows.
+        type: boolean
+        default: true
+      zizmor-persona:
+        description: zizmor strictness - `regular`, `pedantic` or `auditor`.
+        type: string
+        default: regular
+      runners:
+        description: JSON array of runner labels for the `test` matrix, e.g. `["ubuntu-24.04", "ubuntu-24.04-arm", "macos-15", "windows-2025"]`. The first entry also uploads the coverage report. A Windows runner runs the commands under bash.
+        type: string
+        default: '["ubuntu-24.04"]'
+      distros:
+        description: JSON array of container images to run the tests in as well, e.g. `["debian:13", "kalilinux/kali-rolling"]`. GitHub-hosted runners are Ubuntu, macOS and Windows only; another distribution is tested inside its official image on a runner. `[]` skips the job.
+        type: string
+        default: '[]'
+      distro-runners:
+        description: JSON array of runner labels the `distros` run on. Add `ubuntu-24.04-arm` to run the images natively on arm64.
+        type: string
+        default: '["ubuntu-24.04"]'
+      distro-setup-command:
+        description: Shell run as root inside each image before the install command. The default installs python3, python3-venv, python3-pip, git and ca-certificates with apt-get where it exists, else with dnf; non-interactive and quiet. The install and test commands then run in a fresh virtual environment.
+        type: string
+        default: |
+          export DEBIAN_FRONTEND=noninteractive
+          if command -v apt-get >/dev/null 2>&1; then
+            apt-get update -qq
+            apt-get install -y -qq --no-install-recommends python3 python3-venv python3-pip git ca-certificates
+          elif command -v dnf >/dev/null 2>&1; then
+            dnf install -y -q python3 python3-pip git ca-certificates
+          fi
+      distro-egress-policy:
+        description: harden-runner egress policy for the `distro` job. It pulls a distribution image and its package mirrors, whose hosts are not yet measured, so it ships in `audit` and moves to `block` with a measured list in a later release, like every job before it.
+        type: string
+        default: audit
+      egress-policy:
+        description: harden-runner egress policy for every job except `distro` - `audit` logs outbound connections, `block` allows only `allowed-endpoints`.
+        type: string
+        default: audit
+      allowed-endpoints:
+        description: harden-runner allow-list for `block`, space-separated host:port entries. The default is every endpoint this workflow's jobs reached in audit mode across the calling repositories; the runner's own infrastructure needs no entry. Wildcards are not supported and a newline-separated list matches nothing.
+        type: string
+        default: "api.doppler.com:443 api.github.com:443 auth.docker.io:443 cli.codecov.io:443 deb.debian.org:80 files.pythonhosted.org:443 ghcr.io:443 github.com:443 ingest.codecov.io:443 keybase.io:443 pkg-containers.githubusercontent.com:443 production.cloudfront.docker.com:443 pypi.org:443 raw.githubusercontent.com:443 registry-1.docker.io:443 registry.npmjs.org:443 release-assets.githubusercontent.com:443 storage.googleapis.com:443"
+      extra-allowed-endpoints:
+        description: Appended to `allowed-endpoints`, for hosts only this repository reaches, such as an apt repository its Dockerfile adds. Same format.
+        type: string
+        default: ""
+      doppler-project:
+        description: Doppler project slug.
+        type: string
+        default: ""
+      doppler-config:
+        description: Doppler config slug holding CI secrets.
+        type: string
+        default: ""
+      doppler-identity-id:
+        description: Doppler Service Account Identity UUID for OIDC.
+        type: string
+        default: ""
+      doppler-trusted-refs-only:
+        description: Fetch CI secrets only on the default branch, a tag or a schedule; never on a pull request or another branch. `false` restores fetching on every same-repository run.
+        type: boolean
+        default: true
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        default: 30
+    secrets:
+      DOPPLER_TOKEN:
+        description: Doppler Service Token fallback when OIDC is not configured.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.lint-python-version }}
+          cache: pip
+
+      - name: Install linters
+        env:
+          COMMAND: ${{ inputs.lint-install-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+
+      - name: Lint
+        continue-on-error: ${{ inputs.lint-continue-on-error }}
+        env:
+          COMMAND: ${{ inputs.lint-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+
+  workflow-lint:
+    name: Workflow lint (actionlint, zizmor)
+    if: inputs.workflow-lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          version: 1.7.11
+          fail-on-error: true
+
+      - uses: zizmorcore/zizmor-action@85b2b9fb8e3325e7a23d7d0a9d7ba5ae0f999e3e # v0.7.1
+        with:
+          version: 1.30.1
+          persona: ${{ inputs.zizmor-persona }}
+          # Findings go to the log and fail the job; the Security tab would
+          # need security-events: write from every caller for a lint.
+          advanced-security: false
+
+  test:
+    name: Test (Python ${{ matrix.python-version }}, ${{ matrix.runner }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read  # no id-token here: this job runs the caller's own code
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.python-versions) }}
+        runner: ${{ fromJSON(inputs.runners) }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        env:
+          COMMAND: ${{ inputs.install-command }}
+        shell: bash
+        run: bash -eo pipefail -c "$COMMAND"
+
+      - name: Run tests
+        env:
+          COMMAND: ${{ inputs.test-command }}
+        shell: bash
+        run: bash -eo pipefail -c "$COMMAND"
+
+      - name: Upload coverage report
+        if: matrix.python-version == inputs.coverage-python-version && matrix.runner == fromJSON(inputs.runners)[0] && hashFiles(inputs.coverage-file) != ''
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: coverage
+          path: ${{ inputs.coverage-file }}
+          retention-days: 7
+
+
+  # The same tests inside other distributions' official images, on the
+  # runners that exist (Ubuntu, and Ubuntu on arm64). The image gets the
+  # workspace mounted, the three commands as environment variables and a
+  # fresh virtual environment, so nothing here is interpolated into a script.
+  distro:
+    name: Distro (${{ matrix.image }}, ${{ matrix.runner }})
+    if: inputs.distros != '[]'
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read  # no id-token here: this job runs the caller's own code
+    strategy:
+      fail-fast: false
+      matrix:
+        image: ${{ fromJSON(inputs.distros) }}
+        runner: ${{ fromJSON(inputs.distro-runners) }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.distro-egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.distro-egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Run the tests in the image
+        env:
+          IMAGE: ${{ matrix.image }}
+          SETUP: ${{ inputs.distro-setup-command }}
+          INSTALL: ${{ inputs.install-command }}
+          TEST: ${{ inputs.test-command }}
+        run: |
+          docker run --rm -v "$GITHUB_WORKSPACE:/src" -w /src -e CI=true -e SETUP -e INSTALL -e TEST "$IMAGE" \
+            bash -eo pipefail -c 'eval "$SETUP"; python3 -m venv /tmp/venv; . /tmp/venv/bin/activate; eval "$INSTALL"; eval "$TEST"'
+
+  coverage:
+    name: Coverage upload
+    # Runs only where a secret may exist at all: never on a pull request, and
+    # apart from the job that executes the caller's own code, so that code
+    # never runs in a job holding an OIDC token.
+    if: inputs.codecov && github.event_name != 'pull_request'
+    needs: test
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      id-token: write  # OIDC: the Codecov upload verifies it; the Doppler fetch uses it
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Download the coverage report
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: coverage
+
+      # --- Doppler (same steps as .github/actions/doppler-secrets) ---------
+      - name: Decide how to authenticate to Doppler
+        id: doppler
+        env:
+          IDENTITY_ID: ${{ inputs.doppler-identity-id }}
+          TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+          PROJECT: ${{ inputs.doppler-project }}
+          CONFIG: ${{ inputs.doppler-config }}
+          REQUIRED: "false"
+          TRUSTED_ONLY: ${{ inputs.doppler-trusted-refs-only }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          mode=none
+          skip=""
+          # A trusted ref is one only a push by someone with write access, or the
+          # schedule, can produce: the default branch, a tag, or a scheduled run
+          # (which GitHub always starts from the default branch). A pull request
+          # is never trusted, whichever repository its head is in.
+          trusted=false
+          case "$EVENT" in
+            schedule) trusted=true ;;
+            pull_request|pull_request_target) trusted=false ;;
+            *)
+              if [ -n "$DEFAULT_BRANCH" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+                trusted=true
+              elif [ "${REF#refs/tags/}" != "$REF" ]; then
+                trusted=true
+              fi ;;
+          esac
+          if [ "$IS_FORK" = "true" ]; then
+            # A fork's pull request has no id-token and must never receive a
+            # secret. Silent skip is correct here, whatever `required` says.
+            skip="pull request from a fork"
+          elif [ "$TRUSTED_ONLY" = "true" ] && [ "$trusted" != "true" ]; then
+            skip="$EVENT on $REF is not the default branch, a tag or a schedule (trusted-refs-only)"
+          elif [ -n "$IDENTITY_ID" ]; then
+            mode=oidc
+          elif [ -n "$TOKEN" ]; then
+            mode=token
+          fi
+          if [ -n "$skip" ]; then
+            echo "::notice title=Doppler::$skip - no secrets are fetched"
+          fi
+          if [ "$mode" != "none" ] && { [ -z "$PROJECT" ] || [ -z "$CONFIG" ]; }; then
+            echo "::error title=Doppler::project and config are required when authenticating"
+            exit 1
+          fi
+          if [ "$mode" = "none" ] && [ -z "$skip" ]; then
+            if [ "$REQUIRED" = "true" ]; then
+              echo "::error title=Doppler::no identity-id and no DOPPLER_TOKEN; this job needs one (see README, 'Doppler setup')"
+              exit 1
+            fi
+            echo "::notice title=Doppler::not configured (no identity-id, no DOPPLER_TOKEN) - continuing without CI secrets"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Doppler auth mode: $mode"
+
+      - name: Fetch CI secrets from Doppler (OIDC)
+        if: steps.doppler.outputs.mode == 'oidc'
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ inputs.doppler-identity-id }}
+          doppler-project: ${{ inputs.doppler-project }}
+          doppler-config: ${{ inputs.doppler-config }}
+          inject-env-vars: true
+
+      - name: Fetch CI secrets from Doppler (Service Token)
+        if: steps.doppler.outputs.mode == 'token'
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          doppler-token: ${{ secrets.DOPPLER_TOKEN }}
+          doppler-project: ${{ inputs.doppler-project }}
+          doppler-config: ${{ inputs.doppler-config }}
+          inject-env-vars: true
+      # ---------------------------------------------------------------------
+
+      # Codecov verifies this job's GitHub OIDC token, so a public repository
+      # needs no Codecov token at all and nothing from Doppler reaches this
+      # step. The Doppler steps above stay so a caller's `ci` config is still
+      # exported here for anything else it may hold.
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
+        with:
+          files: ${{ inputs.coverage-file }}
+          fail_ci_if_error: false
+          use_oidc: true
+
+  smoke:
+    name: Smoke test
+    if: inputs.smoke-command != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.coverage-python-version }}
+          cache: pip
+
+      - name: Install the project
+        env:
+          COMMAND: ${{ inputs.smoke-install-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+
+      - name: Smoke test
+        env:
+          COMMAND: ${{ inputs.smoke-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+
+  docker:
+    name: Container build
+    if: inputs.docker-build
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build image
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: ${{ inputs.docker-context }}
+          file: ${{ inputs.dockerfile }}
+          push: false
+          load: true
+          tags: ci-image:local
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Check the image
+        if: inputs.docker-test-command != ''
+        env:
+          IMAGE: ci-image:local
+          COMMAND: ${{ inputs.docker-test-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+
+  # The one job branch protection should require. `always()` so it runs when
+  # a needed job was skipped; the shell then decides what counts as green.
+  ci-green:
+    name: CI green
+    if: always()
+    needs: [lint, workflow-lint, test, distro, coverage, smoke, docker]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - name: Every job passed or was deliberately skipped
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          bad=$(echo "$RESULTS" | python3 -c '
+          import json, sys
+          needs = json.load(sys.stdin)
+          print(" ".join(k for k, v in needs.items() if v["result"] not in ("success", "skipped")))
+          ')
+          if [ -n "$bad" ]; then
+            echo "::error::failed jobs: $bad"
+            exit 1
+          fi

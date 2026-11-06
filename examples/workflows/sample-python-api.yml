@@ -1,0 +1,47 @@
+# Sample only: feature-branch dev scan, PR security gate and local image scan.
+name: Sample - Python API
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sample-python-api-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/dev-security-scan.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/python-api
+      artifact-prefix: sample-python-dev
+
+  pr:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/pr-security-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/python-api
+      artifact-prefix: sample-python-pr
+
+  image:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/image-security-scan.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      dockerfile: apps/python-api/Dockerfile
+      docker-context: apps/python-api
+      artifact-prefix: sample-python-image

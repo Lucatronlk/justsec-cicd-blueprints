@@ -1,0 +1,69 @@
+# App-specific entrypoint: k8s. Image and full run only on manual dispatch.
+name: CI - k8s
+on:
+  push:
+    paths:
+      - 'apps/k8s/**'
+  pull_request:
+    paths:
+      - 'apps/k8s/**'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Scan profile
+        type: choice
+        required: true
+        default: dev
+        options:
+          - dev
+          - pr
+          - full
+permissions:
+  contents: read
+concurrency:
+  group: ci-k8s-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dev:
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'dev') }}
+    uses: ./.github/workflows/profile-dev.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/k8s
+      artifact-prefix: k8s-dev
+      upload-sarif: false
+  pr:
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'pr') }}
+    uses: ./.github/workflows/profile-pr-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/k8s
+      artifact-prefix: k8s-pr
+      upload-sarif: false
+  full:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'full' }}
+    uses: ./.github/workflows/profile-full.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/k8s
+      artifact-prefix: k8s-full
+      upload-sarif: false
+      dockerfile: apps/k8s/Dockerfile
+      docker-context: apps/k8s
+  image:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'image' }}
+    uses: ./.github/workflows/profile-image.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      dockerfile: apps/k8s/Dockerfile
+      artifact-prefix: k8s-image
+      upload-sarif: false
+      docker-context: apps/k8s

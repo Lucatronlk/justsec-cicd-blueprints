@@ -1,0 +1,64 @@
+# App-specific entrypoint: sample-app. Image and full run only on manual dispatch.
+name: CI - sample-app
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Scan profile
+        type: choice
+        required: true
+        default: dev
+        options:
+          - dev
+          - pr
+          - full
+          - image
+permissions:
+  contents: read
+concurrency:
+  group: ci-sample-app-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dev:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'dev' }}
+    uses: ./.github/workflows/profile-dev.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/sample-app
+      artifact-prefix: sample-app-dev
+      upload-sarif: false
+  pr:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'pr' }}
+    uses: ./.github/workflows/profile-pr-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/sample-app
+      artifact-prefix: sample-app-pr
+      upload-sarif: false
+  full:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'full' }}
+    uses: ./.github/workflows/profile-full.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/sample-app
+      artifact-prefix: sample-app-full
+      upload-sarif: false
+      dockerfile: apps/sample-app/Dockerfile
+      docker-context: apps/sample-app
+  image:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'image' }}
+    uses: ./.github/workflows/profile-image.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      dockerfile: apps/sample-app/Dockerfile
+      artifact-prefix: sample-app-image
+      upload-sarif: false
+      docker-context: apps/sample-app

@@ -1,0 +1,159 @@
+# Only automatic entry point. Reusable workflows are invoked on selected targets.
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      apps:
+        description: 'all or comma-separated app names (fixtures must be explicit)'
+        required: true
+        default: all
+        type: string
+      depth:
+        description: Scan depth
+        required: true
+        default: minimum
+        type: choice
+        options: [minimum, pr, full]
+  schedule:
+    - cron: '0 5 * * 1'
+permissions:
+  contents: read
+concurrency:
+  group: scan-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  select:
+    name: Select scan targets
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+      count: ${{ steps.plan.outputs.count }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+      - id: plan
+        name: Select and validate registered apps
+        env:
+          EVENT: ${{ github.event_name }}
+          APPS: ${{ inputs.apps }}
+          DEPTH: ${{ inputs.depth }}
+          BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
+          HEAD: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = workflow_dispatch ]; then
+            python3 scripts/select_scan_targets.py --select "$APPS" --depth "$DEPTH" --github-output "$GITHUB_OUTPUT"
+          elif [ "$EVENT" = schedule ]; then
+            python3 scripts/select_scan_targets.py --select all --depth full --github-output "$GITHUB_OUTPUT"
+          else
+            python3 scripts/select_scan_targets.py --select changed --base "$BASE" --head "$HEAD" --depth minimum --github-output "$GITHUB_OUTPUT"
+          fi
+  workflow-lint:
+    name: Workflow lint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          version: 1.7.11
+          fail-on-error: true
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          version: 1.30.1
+          persona: pedantic
+          advanced-security: false
+  test:
+    name: Test workflow contracts
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.13'
+          cache: pip
+      - name: Install pinned test dependencies
+        run: pip install --require-hashes -r requirements-dev.txt
+      - name: Lint and test
+        run: |
+          ruff check tests/ scripts/select_scan_targets.py
+          ruff format --check tests/ scripts/select_scan_targets.py
+          pytest -q
+  secrets:
+    name: Repository secrets
+    uses: ./.github/workflows/profile-secrets.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      artifact-prefix: repo-secrets
+      upload-sarif: false
+  app-scan:
+    name: Scan ${{ matrix.app }} (${{ matrix.depth }})
+    needs: [select]
+    if: needs.select.result == 'success' && needs.select.outputs.count != '0'
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix: ${{ fromJSON(needs.select.outputs.matrix) }}
+    uses: ./.github/workflows/scan-app.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write
+    with:
+      app: ${{ matrix.app }}
+      path: ${{ matrix.path }}
+      artifact-prefix: ${{ matrix['artifact-prefix'] }}
+      depth: ${{ matrix.depth }}
+      dockerfile: ${{ matrix.dockerfile || '' }}
+      context: ${{ matrix.context || '.' }}
+  security-green:
+    name: Security green
+    if: always()
+    needs: [select, workflow-lint, test, secrets, app-scan]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require all selected checks
+        env:
+          SELECT: ${{ needs.select.result }}
+          COUNT: ${{ needs.select.outputs.count }}
+          LINT: ${{ needs.workflow-lint.result }}
+          TEST: ${{ needs.test.result }}
+          SECRETS: ${{ needs.secrets.result }}
+          APPS: ${{ needs.app-scan.result }}
+        run: |
+          set -euo pipefail
+          for result in "$SELECT" "$LINT" "$TEST" "$SECRETS"; do test "$result" = success; done
+          if [ "$COUNT" = 0 ]; then
+            test "$APPS" = skipped
+          else
+            test "$APPS" = success
+          fi

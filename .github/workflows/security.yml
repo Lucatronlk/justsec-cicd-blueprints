@@ -1,0 +1,620 @@
+# Reusable security checks for a Python repository.
+#
+#   codeql             SAST; findings land in the Security tab.
+#   gitleaks           Secret scan over the full history, on top of what Doppler
+#                      already prevents by keeping secrets out of the tree.
+#   pip-audit          Known vulnerabilities in the pinned dependencies.
+#   dependency-review  On pull requests: what a dependency change brings in.
+#   snyk               Optional; SNYK_TOKEN comes from the Doppler config.
+#   scorecard          Optional; OpenSSF Scorecard on the default branch.
+#
+# Call it with:
+#
+#   on:
+#     push: { branches: [main] }
+#     pull_request:
+#     schedule: [{ cron: '0 6 * * 1' }]
+#   jobs:
+#     security:
+#       uses: Lucatronlk/justsec-cicd-blueprints/.github/workflows/security.yml@<sha> # vX.Y.Z
+#       permissions:
+#         contents: read
+#         security-events: write
+#         pull-requests: write     # dependency-review's PR summary comment
+#         id-token: write          # Doppler OIDC; Scorecard publishing
+#       secrets:
+#         DOPPLER_TOKEN: ${{ secrets.DOPPLER_TOKEN }}   # optional fallback
+#
+# gitleaks-action needs no licence for a personal account. A repository under
+# an organisation needs GITLEAKS_LICENSE, which is read from the Doppler
+# config when one is given. A `.gitleaks.toml` at the caller's root is picked
+# up automatically for allowlisting documented placeholders.
+
+name: Security (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      codeql:
+        description: Run CodeQL.
+        type: boolean
+        default: true
+      codeql-languages:
+        description: CodeQL languages, comma-separated. `actions` scans the workflow files themselves and fits every repository; a repository with no Python passes `actions` alone, since CodeQL fails on a language with no source.
+        type: string
+        default: python,actions
+      codeql-queries:
+        description: CodeQL query suite.
+        type: string
+        default: security-extended
+      codeql-config:
+        description: Inline CodeQL configuration (YAML), for example paths-ignore.
+        type: string
+        default: ""
+      gitleaks:
+        description: Run gitleaks over the full history.
+        type: boolean
+        default: true
+      pip-audit-requirements:
+        description: Requirements file audited by pip-audit; empty skips that step. With `audit-command` empty too, the job is skipped.
+        type: string
+        default: requirements.txt
+      pip-audit-continue-on-error:
+        description: Report advisories without failing the job. A migration aid, not a resting state.
+        type: boolean
+        default: false
+      pip-audit-extra-args:
+        description: Extra pip-audit arguments, e.g. `--ignore-vuln PYSEC-2026-3740` for an advisory with no fix yet. Name the reason in the caller.
+        type: string
+        default: ""
+      audit-install-command:
+        description: Shell run before `audit-command`, e.g. `npm ci --ignore-scripts` or `cargo install cargo-audit`; empty installs nothing. Python is available.
+        type: string
+        default: ""
+      audit-command:
+        description: A dependency audit that is not pip-shaped, e.g. `npm audit --audit-level=high`, `govulncheck ./...`, `cargo audit`; empty runs none. Runs in the same job as pip-audit, after it.
+        type: string
+        default: ""
+      audit-continue-on-error:
+        description: Report `audit-command` findings without failing the job. A migration aid, not a resting state.
+        type: boolean
+        default: false
+      dependency-review:
+        description: Run dependency-review on pull requests.
+        type: boolean
+        default: true
+      dependency-review-severity:
+        description: Fail the review at this severity or above.
+        type: string
+        default: moderate
+      dependency-review-allow-ghsas:
+        description: Comma-separated GitHub Advisory IDs the review may not fail on. Each one must have an entry in the shared repository's baseline/risk-register.yaml (the audit checks); an advisory with no fixed release is the usual case.
+        type: string
+        default: ""
+      snyk:
+        description: Run Snyk Code and Snyk Open Source. Needs SNYK_TOKEN in the Doppler config.
+        type: boolean
+        default: false
+      scorecard:
+        description: Run OpenSSF Scorecard and publish the result. Runs only on the default branch (push or schedule).
+        type: boolean
+        default: false
+      python-version:
+        description: Python for pip-audit and Snyk.
+        type: string
+        default: "3.13"
+      egress-policy:
+        description: harden-runner egress policy for every job - `audit` logs outbound connections, `block` allows only `allowed-endpoints`.
+        type: string
+        default: audit
+      allowed-endpoints:
+        description: harden-runner allow-list for `block`, space-separated host:port entries. The default is every endpoint this workflow's jobs reached in audit mode across the calling repositories; the runner's own infrastructure needs no entry. Wildcards are not supported and a newline-separated list matches nothing.
+        type: string
+        default: "api.deps.dev:443 api.doppler.com:443 api.github.com:443 api.osv.dev:443 api.scorecard.dev:443 api.securityscorecards.dev:443 api.snyk.io:443 app.snyk.io:443 codeload.github.com:443 deeproxy.snyk.io:443 downloads.snyk.io:443 files.pythonhosted.org:443 fulcio.sigstore.dev:443 github.com:443 oss-fuzz-build-logs.storage.googleapis.com:443 pypi.org:443 rekor.sigstore.dev:443 release-assets.githubusercontent.com:443 static.snyk.io:443 tuf-repo-cdn.sigstore.dev:443 uploads.github.com:443 www.bestpractices.dev:443"
+      extra-allowed-endpoints:
+        description: Appended to `allowed-endpoints`, for hosts only this repository reaches, such as an apt repository its Dockerfile adds. Same format.
+        type: string
+        default: ""
+      doppler-project:
+        description: Doppler project slug.
+        type: string
+        default: ""
+      doppler-config:
+        description: Doppler config slug holding CI secrets.
+        type: string
+        default: ""
+      doppler-identity-id:
+        description: Doppler Service Account Identity UUID for OIDC.
+        type: string
+        default: ""
+      doppler-trusted-refs-only:
+        description: Fetch CI secrets only on the default branch, a tag or a schedule; never on a pull request or another branch. `false` restores fetching on every same-repository run.
+        type: boolean
+        default: true
+      timeout-minutes:
+        description: Per-job timeout.
+        type: number
+        default: 30
+    secrets:
+      DOPPLER_TOKEN:
+        description: Doppler Service Token fallback when OIDC is not configured.
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  codeql:
+    name: CodeQL
+    if: inputs.codeql
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write  # CodeQL SARIF upload
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: github/codeql-action/init@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          languages: ${{ inputs.codeql-languages }}
+          queries: ${{ inputs.codeql-queries }}
+          config: ${{ inputs.codeql-config }}
+
+      - uses: github/codeql-action/analyze@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+
+  gitleaks:
+    name: Secret scan (gitleaks)
+    if: inputs.gitleaks
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      # Doppler OIDC for an optional GITLEAKS_LICENSE, and only on a trusted
+      # ref: the decide step skips the fetch on pull requests, so a pull
+      # request's code never runs beside the OIDC token. See BASELINE.md §3.
+      id-token: write  # Doppler OIDC for an optional GITLEAKS_LICENSE
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 0
+
+      # --- Doppler (same steps as .github/actions/doppler-secrets) ---------
+      - name: Decide how to authenticate to Doppler
+        id: doppler
+        if: inputs.doppler-project != ''
+        env:
+          IDENTITY_ID: ${{ inputs.doppler-identity-id }}
+          TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+          PROJECT: ${{ inputs.doppler-project }}
+          CONFIG: ${{ inputs.doppler-config }}
+          REQUIRED: "false"
+          TRUSTED_ONLY: ${{ inputs.doppler-trusted-refs-only }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          mode=none
+          skip=""
+          # A trusted ref is one only a push by someone with write access, or the
+          # schedule, can produce: the default branch, a tag, or a scheduled run
+          # (which GitHub always starts from the default branch). A pull request
+          # is never trusted, whichever repository its head is in.
+          trusted=false
+          case "$EVENT" in
+            schedule) trusted=true ;;
+            pull_request|pull_request_target) trusted=false ;;
+            *)
+              if [ -n "$DEFAULT_BRANCH" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+                trusted=true
+              elif [ "${REF#refs/tags/}" != "$REF" ]; then
+                trusted=true
+              fi ;;
+          esac
+          if [ "$IS_FORK" = "true" ]; then
+            # A fork's pull request has no id-token and must never receive a
+            # secret. Silent skip is correct here, whatever `required` says.
+            skip="pull request from a fork"
+          elif [ "$TRUSTED_ONLY" = "true" ] && [ "$trusted" != "true" ]; then
+            skip="$EVENT on $REF is not the default branch, a tag or a schedule (trusted-refs-only)"
+          elif [ -n "$IDENTITY_ID" ]; then
+            mode=oidc
+          elif [ -n "$TOKEN" ]; then
+            mode=token
+          fi
+          if [ -n "$skip" ]; then
+            echo "::notice title=Doppler::$skip - no secrets are fetched"
+          fi
+          if [ "$mode" != "none" ] && { [ -z "$PROJECT" ] || [ -z "$CONFIG" ]; }; then
+            echo "::error title=Doppler::project and config are required when authenticating"
+            exit 1
+          fi
+          if [ "$mode" = "none" ] && [ -z "$skip" ]; then
+            if [ "$REQUIRED" = "true" ]; then
+              echo "::error title=Doppler::no identity-id and no DOPPLER_TOKEN; this job needs one (see README, 'Doppler setup')"
+              exit 1
+            fi
+            echo "::notice title=Doppler::not configured (no identity-id, no DOPPLER_TOKEN) - continuing without CI secrets"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Doppler auth mode: $mode"
+
+      - name: Fetch CI secrets from Doppler (OIDC)
+        if: steps.doppler.outputs.mode == 'oidc'
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ inputs.doppler-identity-id }}
+          doppler-project: ${{ inputs.doppler-project }}
+          doppler-config: ${{ inputs.doppler-config }}
+          inject-env-vars: true
+
+      - name: Fetch CI secrets from Doppler (Service Token)
+        if: steps.doppler.outputs.mode == 'token'
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          doppler-token: ${{ secrets.DOPPLER_TOKEN }}
+          doppler-project: ${{ inputs.doppler-project }}
+          doppler-config: ${{ inputs.doppler-config }}
+          inject-env-vars: true
+      # ---------------------------------------------------------------------
+
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GITLEAKS_LICENSE: ${{ env.GITLEAKS_LICENSE }}
+          GITLEAKS_ENABLE_COMMENTS: "false"
+
+  dependency-audit:
+    name: Dependency audit
+    if: inputs.pip-audit-requirements != '' || inputs.audit-command != ''
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install pip-audit
+        if: inputs.pip-audit-requirements != ''
+        run: pip install pip-audit==2.10.1
+
+      # Scoped to the declared dependencies on purpose. Auditing the whole
+      # environment reports advisories against the runner's own pip and
+      # setuptools, which nobody here ships or controls, and a recurring red
+      # that everyone learns to ignore is worse than no check.
+      - name: Audit pinned dependencies (pip-audit)
+        if: inputs.pip-audit-requirements != ''
+        continue-on-error: ${{ inputs.pip-audit-continue-on-error }}
+        env:
+          REQUIREMENTS: ${{ inputs.pip-audit-requirements }}
+          EXTRA_ARGS: ${{ inputs.pip-audit-extra-args }}
+        run: |
+          read -r -a extra <<< "$EXTRA_ARGS"
+          pip-audit --requirement "$REQUIREMENTS" --strict "${extra[@]}"
+
+      # The same job for any other ecosystem: the caller names the tool. The
+      # command reaches the shell through the environment, as every caller
+      # command does, and this job holds contents: read and nothing else.
+      - name: Install the audit tool
+        if: inputs.audit-install-command != ''
+        env:
+          COMMAND: ${{ inputs.audit-install-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+
+      - name: Audit dependencies (audit-command)
+        if: inputs.audit-command != ''
+        continue-on-error: ${{ inputs.audit-continue-on-error }}
+        env:
+          COMMAND: ${{ inputs.audit-command }}
+        run: bash -eo pipefail -c "$COMMAND"
+
+  dependency-review:
+    name: Dependency review
+    if: inputs.dependency-review && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      pull-requests: write  # the summary comment on failure
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: ${{ inputs.dependency-review-severity }}
+          allow-ghsas: ${{ inputs.dependency-review-allow-ghsas }}
+          comment-summary-in-pr: on-failure
+
+  snyk:
+    name: Snyk
+    # Never on a pull request: the job holds an OIDC token for SNYK_TOKEN, and
+    # a pull request's code must not run beside one.
+    if: inputs.snyk && github.event_name != 'pull_request'
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write  # Snyk SARIF upload
+      id-token: write  # Doppler OIDC for SNYK_TOKEN
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # --- Doppler (same steps as .github/actions/doppler-secrets) ---------
+      - name: Decide how to authenticate to Doppler
+        id: doppler
+        env:
+          IDENTITY_ID: ${{ inputs.doppler-identity-id }}
+          TOKEN: ${{ secrets.DOPPLER_TOKEN }}
+          PROJECT: ${{ inputs.doppler-project }}
+          CONFIG: ${{ inputs.doppler-config }}
+          REQUIRED: "false"
+          TRUSTED_ONLY: ${{ inputs.doppler-trusted-refs-only }}
+          IS_FORK: ${{ github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name != github.repository }}
+          EVENT: ${{ github.event_name }}
+          REF: ${{ github.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          mode=none
+          skip=""
+          # A trusted ref is one only a push by someone with write access, or the
+          # schedule, can produce: the default branch, a tag, or a scheduled run
+          # (which GitHub always starts from the default branch). A pull request
+          # is never trusted, whichever repository its head is in.
+          trusted=false
+          case "$EVENT" in
+            schedule) trusted=true ;;
+            pull_request|pull_request_target) trusted=false ;;
+            *)
+              if [ -n "$DEFAULT_BRANCH" ] && [ "$REF" = "refs/heads/$DEFAULT_BRANCH" ]; then
+                trusted=true
+              elif [ "${REF#refs/tags/}" != "$REF" ]; then
+                trusted=true
+              fi ;;
+          esac
+          if [ "$IS_FORK" = "true" ]; then
+            # A fork's pull request has no id-token and must never receive a
+            # secret. Silent skip is correct here, whatever `required` says.
+            skip="pull request from a fork"
+          elif [ "$TRUSTED_ONLY" = "true" ] && [ "$trusted" != "true" ]; then
+            skip="$EVENT on $REF is not the default branch, a tag or a schedule (trusted-refs-only)"
+          elif [ -n "$IDENTITY_ID" ]; then
+            mode=oidc
+          elif [ -n "$TOKEN" ]; then
+            mode=token
+          fi
+          if [ -n "$skip" ]; then
+            echo "::notice title=Doppler::$skip - no secrets are fetched"
+          fi
+          if [ "$mode" != "none" ] && { [ -z "$PROJECT" ] || [ -z "$CONFIG" ]; }; then
+            echo "::error title=Doppler::project and config are required when authenticating"
+            exit 1
+          fi
+          if [ "$mode" = "none" ] && [ -z "$skip" ]; then
+            if [ "$REQUIRED" = "true" ]; then
+              echo "::error title=Doppler::no identity-id and no DOPPLER_TOKEN; this job needs one (see README, 'Doppler setup')"
+              exit 1
+            fi
+            echo "::notice title=Doppler::not configured (no identity-id, no DOPPLER_TOKEN) - continuing without CI secrets"
+          fi
+          echo "mode=$mode" >> "$GITHUB_OUTPUT"
+          echo "Doppler auth mode: $mode"
+
+      - name: Fetch CI secrets from Doppler (OIDC)
+        if: steps.doppler.outputs.mode == 'oidc'
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          auth-method: oidc
+          doppler-identity-id: ${{ inputs.doppler-identity-id }}
+          doppler-project: ${{ inputs.doppler-project }}
+          doppler-config: ${{ inputs.doppler-config }}
+          inject-env-vars: true
+
+      - name: Fetch CI secrets from Doppler (Service Token)
+        if: steps.doppler.outputs.mode == 'token'
+        uses: dopplerhq/secrets-fetch-action@451892f16195f9ac360e1a5bcbf0b5fd0e957534 # v2.0.0
+        with:
+          doppler-token: ${{ secrets.DOPPLER_TOKEN }}
+          doppler-project: ${{ inputs.doppler-project }}
+          doppler-config: ${{ inputs.doppler-config }}
+          inject-env-vars: true
+      # ---------------------------------------------------------------------
+
+      # No token means no scan, said out loud in the run's annotations rather
+      # than as a red job on every pull request before Doppler is wired up.
+      - name: Check for SNYK_TOKEN
+        id: token
+        run: |
+          if [ -z "${SNYK_TOKEN:-}" ]; then
+            echo "::warning title=Snyk::snyk is enabled but SNYK_TOKEN is not in the Doppler config - scan skipped"
+            echo "present=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        if: steps.token.outputs.present == 'true'
+        with:
+          python-version: ${{ inputs.python-version }}
+
+      - name: Install dependencies for Snyk Open Source
+        if: steps.token.outputs.present == 'true'
+        env:
+          REQUIREMENTS: ${{ inputs.pip-audit-requirements }}
+        run: |
+          # A lock with hashes is installed under --require-hashes, the same way
+          # the images install it; a plain pin list is installed as it is.
+          if [ -n "$REQUIREMENTS" ]; then
+            if grep -q -- '--hash=' "$REQUIREMENTS"; then
+              pip install --require-hashes -r "$REQUIREMENTS"
+            else
+              pip install -r "$REQUIREMENTS"
+            fi
+          fi
+
+      - uses: snyk/actions/setup@9adf32b1121593767fc3c057af55b55db032dc04 # v1.0.0
+        if: steps.token.outputs.present == 'true'
+
+      # Snyk exits 1 when it finds something and 2 when it could not run at
+      # all, an expired or revoked SNYK_TOKEN included. Findings are reported
+      # through the SARIF upload, not by failing the job; a scan that never
+      # happened fails it, so an expired token shows up as a red job on the
+      # next push or schedule instead of a quietly empty Security tab.
+      - name: Snyk Code (SAST)
+        if: steps.token.outputs.present == 'true'
+        run: |
+          if snyk code test --sarif-file-output=snyk-code.sarif; then rc=0; else rc=$?; fi
+          case "$rc" in
+            0|1) ;;
+            *) echo "::error title=Snyk::snyk code test did not run (exit $rc): an expired or revoked SNYK_TOKEN, or a project it could not read"; exit "$rc" ;;
+          esac
+
+      - name: Snyk Open Source (SCA)
+        if: steps.token.outputs.present == 'true'
+        run: |
+          # --skip-unresolved: Snyk's pip resolver matches requirement names to
+          # installed packages and cannot match a requirement with extras
+          # (`name[a,b]>=1`), so it exited 2 on the first real run with
+          # "Missing required packages". The packages are installed and every
+          # other line is still scanned; the one it cannot match is skipped.
+          if snyk test --all-projects --skip-unresolved=true --severity-threshold=high --sarif-file-output=snyk-opensource.sarif; then rc=0; else rc=$?; fi
+          case "$rc" in
+            0|1) ;;
+            *) echo "::error title=Snyk::snyk test did not run (exit $rc): an expired or revoked SNYK_TOKEN, or a project it could not read"; exit "$rc" ;;
+          esac
+
+      # Gated on the token as well as the file: a repository that committed an
+      # old scan report would otherwise upload it as if it were fresh.
+      - name: Upload Snyk Code results
+        if: steps.token.outputs.present == 'true' && hashFiles('snyk-code.sarif') != ''
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: snyk-code.sarif
+          category: snyk-code
+
+      - name: Upload Snyk Open Source results
+        if: steps.token.outputs.present == 'true' && hashFiles('snyk-opensource.sarif') != ''
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: snyk-opensource.sarif
+          category: snyk-opensource
+
+  scorecard:
+    name: OpenSSF Scorecard
+    # Scorecard publishes only from the default branch; on a pull request it
+    # would score the base and mislead.
+    if: inputs.scorecard && github.event_name != 'pull_request' && github.ref == format('refs/heads/{0}', github.event.repository.default_branch)
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write  # Scorecard SARIF upload
+      id-token: write  # publishing the result
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: ossf/scorecard-action@fa7117db83c52d787ae5a89f350999701505d78e # v2.5.0
+        with:
+          results_file: results.sarif
+          results_format: sarif
+          publish_results: true
+
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: scorecard.sarif
+          path: results.sarif
+          retention-days: 5
+
+      - uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: results.sarif
+          category: scorecard
+
+  # The one check branch protection names, the same shape as the `CI green`
+  # gate in every `*-ci.yml`: it needs every other job, so a job added here
+  # later is covered without editing the rule.
+  security-green:
+    name: Security green
+    if: always()
+    needs: [codeql, gitleaks, dependency-audit, dependency-review, snyk, scorecard]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - name: Every security job passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": "(failure|cancelled)"'; then
+            echo "::error::a security job failed"
+            exit 1
+          fi

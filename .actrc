@@ -1,0 +1,8 @@
+# nektos/act settings so the workflows can be run locally in Docker.
+# Jobs use hosted labels; map them to an act image. See README.
+--container-architecture linux/amd64
+# Pull once with `docker pull catthehacker/ubuntu:act-latest` (or `act --pull`);
+# anonymous pulls are rate-limited.
+--pull=false
+-P ubuntu-24.04=catthehacker/ubuntu:act-latest
+-P ubuntu-latest=catthehacker/ubuntu:act-latest

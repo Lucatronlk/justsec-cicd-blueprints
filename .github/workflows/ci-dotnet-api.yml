@@ -1,0 +1,70 @@
+# App-specific entrypoint: dotnet-api. Image and full run only on manual dispatch.
+name: CI - dotnet-api
+on:
+  push:
+    paths:
+      - 'apps/dotnet-api/**'
+  pull_request:
+    paths:
+      - 'apps/dotnet-api/**'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Scan profile
+        type: choice
+        required: true
+        default: dev
+        options:
+          - dev
+          - pr
+          - full
+          - image
+permissions:
+  contents: read
+concurrency:
+  group: ci-dotnet-api-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dev:
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'dev') }}
+    uses: ./.github/workflows/profile-dev.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/dotnet-api
+      artifact-prefix: dotnet-api-dev
+      upload-sarif: false
+  pr:
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'pr') }}
+    uses: ./.github/workflows/profile-pr-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/dotnet-api
+      artifact-prefix: dotnet-api-pr
+      upload-sarif: false
+  full:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'full' }}
+    uses: ./.github/workflows/profile-full.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/dotnet-api
+      artifact-prefix: dotnet-api-full
+      upload-sarif: false
+      dockerfile: apps/dotnet-api/Dockerfile
+      docker-context: apps/dotnet-api
+  image:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'image' }}
+    uses: ./.github/workflows/profile-image.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      dockerfile: apps/dotnet-api/Dockerfile
+      artifact-prefix: dotnet-api-image
+      upload-sarif: false
+      docker-context: apps/dotnet-api

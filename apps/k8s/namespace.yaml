@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: scan-samples
+  labels:
+    owner: security-scans
+    service: scan-samples
+    environment: test
+    data-classification: public
+    cost-center: demo
+    managed-by: kubectl
+    incident-contact: repository-maintainer

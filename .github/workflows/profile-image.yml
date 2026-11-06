@@ -1,0 +1,117 @@
+# Container profile: hadolint over the Dockerfile, then the image built from
+# it (never pushed) or pulled by reference, scanned by Trivy and Grype, then
+# the gate. Container publication is currently disabled; this profile does not authorize release bytes.
+#
+# Call it from a repository with:
+#
+#   jobs:
+#     image:
+#       uses: Lucatronlk/justsec-cicd-blueprints/.github/workflows/profile-image.yml@<sha> # vX.Y.Z
+#       permissions:
+#         contents: read
+#         security-events: write
+#       with:
+#         dockerfile: docker/Dockerfile
+#         docker-context: .
+#
+# Branch protection requires `image / Security gate / Security gate`. Every
+# scan is report-only; the gate is the one decision (CRITICAL and HIGH fail by
+# default, on every branch). See README.md "Security scans".
+
+name: Profile - container image (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      artifact-prefix:
+        description: "Prefix of this profile's artifacts and SARIF categories. Give each profile a caller runs in one workflow its own, none a prefix of another."
+        type: string
+        default: "image"
+      fail-on:
+        description: "Comma-separated severities that fail the gate, or `none` to report only."
+        type: string
+        default: "CRITICAL,HIGH"
+      fail-on-secrets:
+        description: "Fail on every secret finding whatever its severity, unverified ones included."
+        type: boolean
+        default: false
+      exceptions-file:
+        description: "Exceptions file in the calling repository."
+        type: string
+        default: ".github/security-exceptions.yml"
+      upload-sarif:
+        description: "Upload SARIF to code scanning (public repository or GitHub Advanced Security)."
+        type: boolean
+        default: true
+      egress-policy:
+        description: "harden-runner egress policy for every job - `audit` logs outbound connections, `block` allows only each job's measured list."
+        type: string
+        default: "audit"
+      extra-allowed-endpoints:
+        description: "Hosts added to every job's allow-list, space-separated host:port. Same format as `allowed-endpoints`."
+        type: string
+        default: ""
+      image:
+        description: "Image reference to pull and scan; empty builds `dockerfile` instead."
+        type: string
+        default: ""
+      dockerfile:
+        description: "Dockerfile to lint, and to build and scan when `image` is empty."
+        type: string
+        default: "Dockerfile"
+      docker-context:
+        description: "Build context for `dockerfile`."
+        type: string
+        default: "."
+      ignore-unfixed:
+        description: "Leave out vulnerabilities with no fixed version."
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  hadolint:
+    uses: ./.github/workflows/scan-hadolint.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-hadolint
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      dockerfiles: ${{ inputs.dockerfile }}
+
+  image:
+    uses: ./.github/workflows/scan-image.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-image
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      image: ${{ inputs.image }}
+      dockerfile: ${{ inputs.dockerfile }}
+      docker-context: ${{ inputs.docker-context }}
+      ignore-unfixed: ${{ inputs.ignore-unfixed }}
+
+  gate:
+    name: Security gate
+    if: always()
+    needs: [hadolint, image]
+    uses: ./.github/workflows/security-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+    with:
+      artifact-prefix: ${{ inputs.artifact-prefix }}
+      fail-on: ${{ inputs.fail-on }}
+      fail-on-secrets: ${{ inputs.fail-on-secrets }}
+      exceptions-file: ${{ inputs.exceptions-file }}
+      upstream-results: ${{ join(needs.*.result, ',') }}
+      expected-reports: hadolint,trivy-image,grype
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}

@@ -1,0 +1,11 @@
+**/bin/
+**/obj/
+.git/
+.env
+.env.*
+*.pem
+*.key
+*.pfx
+README.md
+tests/
+Dockerfile

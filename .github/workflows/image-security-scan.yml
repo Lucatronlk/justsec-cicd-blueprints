@@ -1,0 +1,33 @@
+# Build and scan a local image without publishing it.
+name: Image security scan
+
+on:
+  workflow_call:
+    inputs:
+      dockerfile:
+        description: "Dockerfile relative to the repository root."
+        type: string
+        default: "Dockerfile"
+      docker-context:
+        description: "Build context relative to the repository root."
+        type: string
+        default: "."
+      artifact-prefix:
+        description: "Unique artifact prefix for this stage; do not reuse it for another profile in the same run."
+        type: string
+        default: "stage-image"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    uses: ./.github/workflows/profile-image.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      dockerfile: ${{ inputs.dockerfile }}
+      docker-context: ${{ inputs.docker-context }}
+      artifact-prefix: ${{ inputs.artifact-prefix }}
+      upload-sarif: false

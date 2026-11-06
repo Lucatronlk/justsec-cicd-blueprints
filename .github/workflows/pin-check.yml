@@ -1,0 +1,39 @@
+# Detect scanner tool pins that have drifted stale. Dependabot moves the
+# action SHAs but not the <tool>-version / <tool>-sha256 inputs the scan
+# workflows pin each CLI with, so this scheduled job asks the GitHub API for
+# each tool's latest release and fails when a pinned version is behind it.
+name: Pin check
+
+on:
+  workflow_dispatch:
+
+# One pin check at a time: two dispatches would duplicate the release lookups.
+concurrency:
+  group: pin-check-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    name: Scanner pins current
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+
+      - name: Check scanner pins
+        run: python scripts/check_scanner_pins.py --stale
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

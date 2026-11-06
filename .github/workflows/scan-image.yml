@@ -1,0 +1,224 @@
+# Container image scan with two engines, Trivy and Grype, over an image
+# built from the caller's Dockerfile (never pushed) or pulled by reference.
+#
+# Call it from a repository with:
+#
+#   jobs:
+#     image:
+#       uses: Lucatronlk/justsec-cicd-blueprints/.github/workflows/scan-image.yml@<sha> # vX.Y.Z
+#       permissions:
+#         contents: read
+#         security-events: write
+#
+# Report-only: it never fails on a finding, only when the scanner itself
+# cannot run. The report is uploaded as an artifact for security-gate.yml,
+# which makes the one pass/fail decision (the profile-*.yml workflows wire
+# the two together). The scanner is pinned: a binary by version and SHA-256,
+# an image by digest. Values a caller passes reach the shell through env:.
+
+name: Scan - container image
+
+on:
+  workflow_call:
+    inputs:
+      artifact-name:
+        description: "Name of the artifact the report is uploaded as. Unique per workflow run; the gate downloads by prefix."
+        type: string
+        default: "scan-image"
+      retention-days:
+        description: "Days the report artifact is kept."
+        type: number
+        default: 14
+      upload-sarif:
+        description: "Upload SARIF to the repository's code scanning (needs a public repository or GitHub Advanced Security). The gate never depends on it."
+        type: boolean
+        default: true
+      egress-policy:
+        description: "harden-runner egress policy - `audit` logs outbound connections, `block` allows only `allowed-endpoints`."
+        type: string
+        default: "audit"
+      allowed-endpoints:
+        description: "harden-runner allow-list for `block`, space-separated host:port entries. The default is what this scan reaches; the runner's own infrastructure needs no entry."
+        type: string
+        default: "api.github.com:443 auth.docker.io:443 ghcr.io:443 github.com:443 grype.anchore.io:443 mirror.gcr.io:443 objects.githubusercontent.com:443 pkg-containers.githubusercontent.com:443 production.cloudfront.docker.com:443 registry-1.docker.io:443 release-assets.githubusercontent.com:443"
+      extra-allowed-endpoints:
+        description: "Appended to `allowed-endpoints`, for hosts only this repository needs. Same format."
+        type: string
+        default: ""
+      timeout-minutes:
+        description: "Job timeout."
+        type: number
+        default: 20
+      image:
+        description: "Image reference to pull and scan, e.g. `ghcr.io/owner/app@sha256:...`. Empty builds `dockerfile` instead."
+        type: string
+        default: ""
+      dockerfile:
+        description: "Dockerfile to build and scan when `image` is empty."
+        type: string
+        default: "Dockerfile"
+      docker-context:
+        description: "Build context for `dockerfile`."
+        type: string
+        default: "."
+      ignore-unfixed:
+        description: "Leave out vulnerabilities with no fixed version (Trivy `--ignore-unfixed`, Grype `--only-fixed`). On by default: a base image's unfixable findings are not something a pull request can act on."
+        type: boolean
+        default: true
+      trivy-version:
+        description: "Trivy release to download (aquasecurity/trivy), without the `v`."
+        type: string
+        default: "0.75.0"
+      trivy-sha256:
+        description: "SHA-256 of the Trivy Linux-64bit tarball for that version."
+        type: string
+        default: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f"
+      grype-version:
+        description: "Grype release to download (anchore/grype), without the `v`."
+        type: string
+        default: "0.119.0"
+      grype-sha256:
+        description: "SHA-256 of the Grype linux_amd64 tarball for that version."
+        type: string
+        default: "3fa2dc4b924621ab65404cf08d0b8438d896d80ab949c9d5a4ca283c36004c9b"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: image
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write  # the SARIF upload, a view in the Security tab
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install trivy at the pinned version
+        env:
+          VERSION: ${{ inputs.trivy-version }}
+          SHA256: ${{ inputs.trivy-sha256 }}
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/trivy.download "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz"
+          echo "${SHA256}  /tmp/trivy.download" | sha256sum -c -
+          tar -xzf /tmp/trivy.download -C /tmp trivy
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          install -m 0755 /tmp/trivy "$RUNNER_TEMP/trivy-bin/trivy"
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/trivy-bin/trivy" --version
+
+      - name: Install grype at the pinned version
+        env:
+          VERSION: ${{ inputs.grype-version }}
+          SHA256: ${{ inputs.grype-sha256 }}
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/grype.download "https://github.com/anchore/grype/releases/download/v${VERSION}/grype_${VERSION}_linux_amd64.tar.gz"
+          echo "${SHA256}  /tmp/grype.download" | sha256sum -c -
+          tar -xzf /tmp/grype.download -C /tmp grype
+          mkdir -p "$RUNNER_TEMP/grype-bin"
+          install -m 0755 /tmp/grype "$RUNNER_TEMP/grype-bin/grype"
+          echo "$RUNNER_TEMP/grype-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/grype-bin/grype" version
+
+      - name: Prepare the report directories
+        run: mkdir -p "$RUNNER_TEMP/scan-results" "$RUNNER_TEMP/sarif"
+
+      - name: Build or pull the image
+        id: image
+        env:
+          IMAGE: ${{ inputs.image }}
+          DOCKERFILE: ${{ inputs.dockerfile }}
+          CONTEXT: ${{ inputs.docker-context }}
+        run: |
+          set -euo pipefail
+          if [ -n "$IMAGE" ]; then
+            docker pull "$IMAGE"
+            ref="$IMAGE"
+          else
+            # Built locally, never pushed, no build cache read: what is scanned
+            # is what this commit's Dockerfile produces.
+            ref="scan-target:${GITHUB_SHA}"
+            docker build --pull --no-cache -f "$DOCKERFILE" -t "$ref" "$CONTEXT"
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+
+      - name: trivy image
+        env:
+          REF: ${{ steps.image.outputs.ref }}
+          UNFIXED: ${{ inputs.ignore-unfixed }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$UNFIXED" = "true" ]; then args+=(--ignore-unfixed); fi
+          trivy image --quiet --scanners vuln,secret --format json --exit-code 0 \
+            --output "$RUNNER_TEMP/scan-results/trivy-image.json" "${args[@]}" "$REF"
+          trivy convert --format sarif --output "$RUNNER_TEMP/sarif/trivy-image.sarif" "$RUNNER_TEMP/scan-results/trivy-image.json"
+
+      - name: grype
+        env:
+          REF: ${{ steps.image.outputs.ref }}
+          UNFIXED: ${{ inputs.ignore-unfixed }}
+        run: |
+          set -euo pipefail
+          args=()
+          if [ "$UNFIXED" = "true" ]; then args+=(--only-fixed); fi
+          grype "docker:$REF" -q "${args[@]}" \
+            -o "json=$RUNNER_TEMP/scan-results/grype.json" -o "sarif=$RUNNER_TEMP/sarif/grype.sarif"
+
+      - name: Upload the report for the gate
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/scan-results/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+
+      # hashFiles() only sees the workspace, so presence is checked here.
+      - name: Find the SARIF files
+        id: sarif
+        if: inputs.upload-sarif
+        run: |
+          set -euo pipefail
+          for f in "$RUNNER_TEMP"/sarif/*.sarif; do
+            [ -s "$f" ] || continue
+            name=$(basename "$f" .sarif)
+            echo "${name//-/_}=true" >> "$GITHUB_OUTPUT"
+          done
+
+      # A view in the Security tab, not the decision: a private repository
+      # without Advanced Security, or a fork's pull request, cannot upload,
+      # and the gate does not need it to.
+
+      - name: Upload SARIF (trivy-image.sarif)
+        if: inputs.upload-sarif && steps.sarif.outputs.trivy_image == 'true'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/trivy-image.sarif
+          category: ${{ inputs.artifact-name }}-trivy-image
+
+      # A view in the Security tab, not the decision: a private repository
+      # without Advanced Security, or a fork's pull request, cannot upload,
+      # and the gate does not need it to.
+
+      - name: Upload SARIF (grype.sarif)
+        if: inputs.upload-sarif && steps.sarif.outputs.grype == 'true'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/grype.sarif
+          category: ${{ inputs.artifact-name }}-grype

@@ -1,0 +1,226 @@
+# CI for the workflows themselves: actionlint and zizmor over every workflow
+# and action, the test suite that pins the properties the callers rely on, and
+# the two reusable workflows run against the fixture project from this ref, so
+# a change is exercised here before a caller pins it. security.yml is run the
+# same way by security-self.yml.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  actionlint:
+    name: actionlint
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: raven-actions/actionlint@3d39aea434753780c3b3d4a1a31c854b4dbf49d7 # v2.2.0
+        with:
+          version: 1.7.11
+          fail-on-error: true
+
+  zizmor:
+    name: zizmor
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: zizmorcore/zizmor-action@cc914d7f3750a2d13d75c7f184a1060aa0e9d482 # v0.6.4
+        with:
+          version: 1.30.1
+          persona: pedantic
+          advanced-security: false
+
+  test:
+    name: Test the workflows
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install test dependencies
+        run: pip install --require-hashes -r requirements-dev.txt
+
+      - name: Lint the tests
+        run: |
+          ruff check tests/
+          ruff format --check tests/
+
+      - name: Run the tests
+        run: pytest -q
+
+  # The fixture project (apps/fixture/README.md) through python-ci.yml at this ref.
+  # The grant is what a caller gives: python-ci narrows it to contents: read
+  # on every job but the coverage upload, which never runs on a pull request.
+  fixture-ci:
+    name: fixture
+    # `$/.github/workflows/...` is the form zizmor asks for; actionlint still
+    # rejects it (see security-self.yml).
+    uses: ./.github/workflows/python-ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      id-token: write  # what a caller grants for Codecov and Doppler; python-ci keeps it off the test job
+    with:
+      runners: '["ubuntu-24.04"]'
+      distros: '["debian:12", "debian:13", "ubuntu:24.04", "kalilinux/kali-rolling", "parrotsec/core"]'
+      distro-runners: '["ubuntu-24.04"]'
+      install-command: |
+        python -m pip install --upgrade pip
+        pip install --require-hashes -r apps/fixture/requirements.txt
+        pip install --no-deps ./apps/fixture
+      test-command: pytest apps/fixture/tests
+      lint-install-command: pip install "$(grep -oE '^ruff==[0-9.]+' requirements-dev.txt)"
+      lint-command: ruff check apps/fixture
+      smoke-install-command: pip install --no-deps ./apps/fixture
+      smoke-command: |
+        fixture-app --version
+        python -m fixture_app ci
+      dockerfile: apps/fixture/Dockerfile
+      docker-context: apps/fixture
+      docker-test-command: |
+        docker run --rm "$IMAGE" --version
+        test "$(docker run --rm --entrypoint id "$IMAGE" -u)" != "0"
+      zizmor-persona: pedantic
+
+  # bash-ci.yml at this ref over every script in this repository: the
+  # fixture's, and scripts/doppler-ci-set.sh. Block mode with the workflow's
+  # own default list, so a host the list lacks fails here, named in the log,
+  # before a caller meets it. Workflow lint is off because the jobs above
+  # already run actionlint and zizmor over these files.
+  fixture-bash:
+    name: fixture shell
+    uses: ./.github/workflows/bash-ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+    with:
+      runners: '["ubuntu-24.04"]'
+      distros: '["debian:13", "kalilinux/kali-rolling"]'
+      distro-runners: '["ubuntu-24.04"]'
+      shfmt-args: -i 2 -ci
+      test-command: apps/fixture/tests/test_greet.sh
+      config-lint-command: |
+        yamllint -d '{extends: relaxed, rules: {line-length: disable}}' .github apps/fixture baseline
+      workflow-lint: false
+      egress-policy: block
+
+  # The fixture package through python-package-release.yml at this ref:
+  # build, check, smoke-test from the wheel, never publish. The writes are
+  # what the two publishing jobs declare; publish is false so both are
+  # skipped, and neither checks anything out. Block mode with the default
+  # list, so the build's hosts are measured here.
+  fixture-package:
+    name: fixture package
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/python-package-release.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: write  # the github-release job declares it for the publishing path it never takes here
+      id-token: write  # likewise: PyPI Trusted Publishing and provenance, only when publish is true
+      attestations: write  # likewise: the SLSA provenance record
+    with:
+      publish: false
+      package-directory: apps/fixture
+      verify-command: test "$VERSION" = "0.1.0"
+      smoke-command: |
+        fixture-app --version
+        python -m fixture_app ci
+      release-notes-command: printf 'fixture %s\n' "$VERSION"
+      egress-policy: block
+
+  # tofu-ci.yml at this ref over the fixture's provider-free module: fmt,
+  # validate, tflint and the configuration scan; no plan command, so the
+  # Doppler-gated job is skipped. Block mode with the default list, which
+  # is the tool downloads and Trivy's checks bundle.
+  fixture-tofu:
+    name: fixture tofu
+    uses: ./.github/workflows/tofu-ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      id-token: write  # what a caller grants for the plan job's Doppler fetch; skipped here
+    with:
+      directories: apps/fixture/tofu
+      workflow-lint: false
+      egress-policy: block
+
+  # The fixture image through container-release.yml at this ref: build, check
+  # and scan, never publish. The writes are what the release job declares for
+  # the publishing path; the called job holds them on a pull request from this
+  # repository exactly as it does in every caller, and a fork's pull request,
+  # whose token could not carry them, skips the job.
+  fixture-release:
+    name: fixture release
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
+    uses: ./.github/workflows/container-release.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      packages: write  # the release job declares it for the publishing path it never takes here
+      id-token: write  # likewise: cosign keyless signing and provenance, only after a push
+      attestations: write  # likewise: the SLSA provenance record
+      security-events: write  # the Trivy SARIF upload, which does run
+    with:
+      push: false
+      dockerfile: apps/fixture/Dockerfile
+      context: apps/fixture
+      docker-test-command: |
+        docker run --rm "$IMAGE" --version
+        test "$(docker run --rm --entrypoint id "$IMAGE" -u)" != "0"
+
+  ci-green:
+    name: CI green
+    if: always()
+    needs: [actionlint, zizmor, test, fixture-ci, fixture-bash, fixture-tofu, fixture-package, fixture-release]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: step-security/harden-runner@e14015d583714f6e62063499dc959a02595150a1 # v2.21.1
+        with:
+          egress-policy: audit
+      - name: Every job passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": "(failure|cancelled)"'; then
+            echo "::error::a needed job failed"
+            exit 1
+          fi

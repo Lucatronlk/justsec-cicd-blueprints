@@ -1,0 +1,19 @@
+{
+  "name": "typescript-web-scan-target",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Small TypeScript HTTP API and browser page for safe local scanning",
+  "engines": {
+    "node": ">=20.19.0"
+  },
+  "packageManager": "pnpm@9.15.9",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "test": "tsc -p tsconfig.json && node --test dist/test/*.test.js",
+    "start": "node dist/src/server.js"
+  },
+  "devDependencies": {
+    "@types/node": "20.19.0",
+    "typescript": "5.8.3"
+  }
+}

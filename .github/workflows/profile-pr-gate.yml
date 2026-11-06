@@ -1,0 +1,237 @@
+# The required check for pull requests and every branch push: it looks at
+# what the repository holds and runs the scans that apply. Always: gitleaks,
+# Semgrep, Trivy (dependencies and secrets) and osv-scanner. With
+# infrastructure as code: Trivy config and Checkov; with a Dockerfile:
+# hadolint. Then the gate.
+#
+# Call it from a repository with:
+#
+#   jobs:
+#     security:
+#       uses: Lucatronlk/justsec-cicd-blueprints/.github/workflows/profile-pr-gate.yml@<sha> # vX.Y.Z
+#       permissions:
+#         contents: read
+#         security-events: write
+#
+#   on:
+#     pull_request:
+#     push:
+#
+# Branch protection requires `security / Security gate / Security gate`. Every
+# scan is report-only; the gate is the one decision (CRITICAL and HIGH fail by
+# default, on every branch). See README.md "Security scans".
+
+name: Profile - PR security gate (reusable)
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory to scan, relative to the repository root. The gitleaks history scan always covers the whole repository."
+        type: string
+        default: "."
+      artifact-prefix:
+        description: "Prefix of this profile's artifacts and SARIF categories. Give each profile a caller runs in one workflow its own, none a prefix of another."
+        type: string
+        default: "pr-gate"
+      fail-on:
+        description: "Comma-separated severities that fail the gate, or `none` to report only."
+        type: string
+        default: "CRITICAL,HIGH"
+      fail-on-secrets:
+        description: "Fail on every secret finding whatever its severity, unverified ones included."
+        type: boolean
+        default: false
+      exceptions-file:
+        description: "Exceptions file in the calling repository."
+        type: string
+        default: ".github/security-exceptions.yml"
+      checkov-default-severity:
+        description: "Severity given to Checkov findings that carry none."
+        type: string
+        default: "MEDIUM"
+      semgrep-config:
+        description: "Space-separated Semgrep rule sets or rule files."
+        type: string
+        default: "p/default"
+      upload-sarif:
+        description: "Upload SARIF to code scanning (public repository or GitHub Advanced Security)."
+        type: boolean
+        default: true
+      egress-policy:
+        description: "harden-runner egress policy for every job - `audit` logs outbound connections, `block` allows only each job's measured list."
+        type: string
+        default: "audit"
+      extra-allowed-endpoints:
+        description: "Hosts added to every job's allow-list, space-separated host:port. Same format as `allowed-endpoints`."
+        type: string
+        default: ""
+      allowed-endpoints:
+        description: "harden-runner allow-list for the `detect` job under `block`; each scan carries its own."
+        type: string
+        default: "api.github.com:443 github.com:443"
+      timeout-minutes:
+        description: "Timeout of the `detect` job."
+        type: number
+        default: 5
+
+permissions:
+  contents: read
+
+jobs:
+  detect:
+    name: Detect what to scan
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+    outputs:
+      terraform: ${{ steps.detect.outputs.terraform }}
+      iac: ${{ steps.detect.outputs.iac }}
+      docker: ${{ steps.detect.outputs.docker }}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Detect
+        id: detect
+        env:
+          DIR: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          git ls-files -- "$DIR" > "$RUNNER_TEMP/files.txt"
+          has() { grep -Eq "$1" "$RUNNER_TEMP/files.txt" && echo true || echo false; }
+          terraform=$(has '\.(tf|tofu)$')
+          docker=$(has '(^|/)(Dockerfile|Containerfile)[^/]*$|\.dockerfile$')
+          other=$(has '(^|/)Chart\.yaml$|(^|/)(serverless|template)\.ya?ml$')
+          manifests=false
+          if grep -E '\.ya?ml$' "$RUNNER_TEMP/files.txt" | tr '\n' '\0' \
+               | xargs -0 -r grep -lE '^(apiVersion:|AWSTemplateFormatVersion)' 2>/dev/null | grep -q .; then
+            manifests=true
+          fi
+          iac=false
+          if [ "$terraform" = true ] || [ "$docker" = true ] || [ "$other" = true ] || [ "$manifests" = true ]; then iac=true; fi
+          {
+            echo "terraform=$terraform"
+            echo "docker=$docker"
+            echo "iac=$iac"
+          } | tee -a "$GITHUB_OUTPUT"
+
+  gitleaks:
+    uses: ./.github/workflows/scan-gitleaks.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-gitleaks
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+
+  semgrep:
+    uses: ./.github/workflows/scan-semgrep.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-semgrep
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      working-directory: ${{ inputs.working-directory }}
+      semgrep-config: ${{ inputs.semgrep-config }}
+
+  trivy:
+    uses: ./.github/workflows/scan-trivy.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-trivy-fs
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      working-directory: ${{ inputs.working-directory }}
+      trivy-scanners: vuln,secret
+
+  osv-scanner:
+    uses: ./.github/workflows/scan-osv-scanner.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-osv-scanner
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      working-directory: ${{ inputs.working-directory }}
+
+  trivy-config:
+    needs: detect
+    if: needs.detect.outputs.iac == 'true'
+    uses: ./.github/workflows/scan-trivy.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-trivy-config
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      working-directory: ${{ inputs.working-directory }}
+      trivy-mode: config
+
+  checkov:
+    needs: detect
+    if: needs.detect.outputs.iac == 'true'
+    uses: ./.github/workflows/scan-checkov.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-checkov
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      working-directory: ${{ inputs.working-directory }}
+
+  hadolint:
+    needs: detect
+    if: needs.detect.outputs.docker == 'true'
+    uses: ./.github/workflows/scan-hadolint.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # SARIF to the Security tab
+    with:
+      artifact-name: ${{ inputs.artifact-prefix }}-hadolint
+      upload-sarif: ${{ inputs.upload-sarif }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      working-directory: ${{ inputs.working-directory }}
+
+  gate:
+    name: Security gate
+    if: always()
+    needs: [detect, gitleaks, semgrep, trivy, osv-scanner, trivy-config, checkov, hadolint]
+    uses: ./.github/workflows/security-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+    with:
+      artifact-prefix: ${{ inputs.artifact-prefix }}
+      fail-on: ${{ inputs.fail-on }}
+      fail-on-secrets: ${{ inputs.fail-on-secrets }}
+      exceptions-file: ${{ inputs.exceptions-file }}
+      upstream-results: ${{ join(needs.*.result, ',') }}
+      expected-reports: >-
+        gitleaks,semgrep,trivy-fs,osv-scanner${{ needs.detect.outputs.iac == 'true' && ',trivy-config,checkov' || '' }}${{ needs.detect.outputs.docker == 'true' && ',hadolint' || '' }}
+      egress-policy: ${{ inputs.egress-policy }}
+      extra-allowed-endpoints: ${{ inputs.extra-allowed-endpoints }}
+      checkov-default-severity: ${{ inputs.checkov-default-severity }}

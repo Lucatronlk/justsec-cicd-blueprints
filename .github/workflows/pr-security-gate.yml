@@ -1,0 +1,28 @@
+# Required PR security stage; triggering is owned by the calling workflow.
+name: PR security gate
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory to scan relative to the repository root; history scans cover the whole repository."
+        type: string
+        default: "."
+      artifact-prefix:
+        description: "Unique artifact prefix for this stage; do not reuse it for another profile in the same run."
+        type: string
+        default: "stage-pr-gate"
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    uses: ./.github/workflows/profile-pr-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: ${{ inputs.working-directory }}
+      artifact-prefix: ${{ inputs.artifact-prefix }}
+      upload-sarif: false

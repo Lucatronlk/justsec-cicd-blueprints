@@ -1,0 +1,164 @@
+# Known-vulnerable dependencies with osv-scanner, from every lock and manifest
+# file it recognises (npm, pnpm, yarn, pip, poetry, uv, Go, Cargo, NuGet,
+# Maven, Gradle, Composer, ...). No API key and no database cache.
+#
+# Call it from a repository with:
+#
+#   jobs:
+#     dependencies:
+#       uses: Lucatronlk/justsec-cicd-blueprints/.github/workflows/scan-osv-scanner.yml@<sha> # vX.Y.Z
+#       permissions:
+#         contents: read
+#         security-events: write
+#
+# Report-only: it never fails on a finding, only when the scanner itself
+# cannot run. The report is uploaded as an artifact for security-gate.yml,
+# which makes the one pass/fail decision (the profile-*.yml workflows wire
+# the two together). The scanner is pinned: a binary by version and SHA-256,
+# an image by digest. Values a caller passes reach the shell through env:.
+
+name: Scan - osv-scanner
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory to scan, relative to the repository root."
+        type: string
+        default: "."
+      artifact-name:
+        description: "Name of the artifact the report is uploaded as. Unique per workflow run; the gate downloads by prefix."
+        type: string
+        default: "scan-osv-scanner"
+      retention-days:
+        description: "Days the report artifact is kept."
+        type: number
+        default: 14
+      upload-sarif:
+        description: "Upload SARIF to the repository's code scanning (needs a public repository or GitHub Advanced Security). The gate never depends on it."
+        type: boolean
+        default: true
+      egress-policy:
+        description: "harden-runner egress policy - `audit` logs outbound connections, `block` allows only `allowed-endpoints`."
+        type: string
+        default: "audit"
+      allowed-endpoints:
+        description: "harden-runner allow-list for `block`, space-separated host:port entries. The default is what this scan reaches; the runner's own infrastructure needs no entry."
+        type: string
+        default: "api.deps.dev:443 api.github.com:443 api.osv.dev:443 github.com:443 objects.githubusercontent.com:443 release-assets.githubusercontent.com:443"
+      extra-allowed-endpoints:
+        description: "Appended to `allowed-endpoints`, for hosts only this repository needs. Same format."
+        type: string
+        default: ""
+      timeout-minutes:
+        description: "Job timeout."
+        type: number
+        default: 20
+      osv-scanner-version:
+        description: "osv-scanner release to download (google/osv-scanner), without the `v`."
+        type: string
+        default: "2.6.0"
+      osv-scanner-sha256:
+        description: "SHA-256 of the osv-scanner linux_amd64 binary for that version."
+        type: string
+        default: "ca69b3d3cd08f889a49dc0a383122f71cc528b83803671df5fd874d97485b108"
+      osv-scanner-args:
+        description: "Extra `osv-scanner scan source` arguments, e.g. `--config osv-scanner.toml`."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: osv-scanner
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write  # the SARIF upload, a view in the Security tab
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install osv-scanner at the pinned version
+        env:
+          VERSION: ${{ inputs.osv-scanner-version }}
+          SHA256: ${{ inputs.osv-scanner-sha256 }}
+        run: |
+          set -euo pipefail
+          download="$RUNNER_TEMP/osv-scanner.download"
+          bindir="$RUNNER_TEMP/osv-scanner-bin"
+          mkdir -p "$bindir"
+          curl -sSfL -o "$download" "https://github.com/google/osv-scanner/releases/download/v${VERSION}/osv-scanner_linux_amd64"
+          echo "${SHA256}  $download" | sha256sum -c -
+          install -m 0755 "$download" "$bindir/osv-scanner"
+          echo "$bindir" >> "$GITHUB_PATH"
+          "$bindir/osv-scanner" --version
+
+      - name: Prepare the report directories
+        run: mkdir -p "$RUNNER_TEMP/scan-results" "$RUNNER_TEMP/sarif"
+
+      - name: osv-scanner
+        env:
+          DIR: ${{ inputs.working-directory }}
+          ARGS: ${{ inputs.osv-scanner-args }}
+        run: |
+          set -euo pipefail
+          read -r -a args <<< "$ARGS"
+          json="$RUNNER_TEMP/scan-results/osv-scanner.json"
+          # Exit 0: nothing found, 1: vulnerabilities found (the gate's call),
+          # 128: no lock or manifest to scan. Anything else is a failure to run.
+          for fmt in json sarif; do
+            case "$fmt" in json) out="$json" ;; sarif) out="$RUNNER_TEMP/sarif/osv-scanner.sarif" ;; esac
+            rc=0
+            osv-scanner scan source -r --format "$fmt" --output-file "$out" "${args[@]}" "$DIR" || rc=$?
+            case "$rc" in
+              0 | 1) ;;
+              128) echo "no lock or manifest file under $DIR" ;;
+              *) echo "::error::osv-scanner failed with exit code $rc"; exit "$rc" ;;
+            esac
+          done
+          if [ ! -s "$json" ]; then echo '{"results": []}' > "$json"; fi
+
+      - name: Upload the report for the gate
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/scan-results/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+
+      # hashFiles() only sees the workspace, so presence is checked here.
+      - name: Find the SARIF files
+        id: sarif
+        if: inputs.upload-sarif
+        run: |
+          set -euo pipefail
+          for f in "$RUNNER_TEMP"/sarif/*.sarif; do
+            [ -s "$f" ] || continue
+            name=$(basename "$f" .sarif)
+            echo "${name//-/_}=true" >> "$GITHUB_OUTPUT"
+          done
+
+      # A view in the Security tab, not the decision: a private repository
+      # without Advanced Security, or a fork's pull request, cannot upload,
+      # and the gate does not need it to.
+
+      - name: Upload SARIF (osv-scanner.sarif)
+        if: inputs.upload-sarif && steps.sarif.outputs.osv_scanner == 'true'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/osv-scanner.sarif
+          category: ${{ inputs.artifact-name }}

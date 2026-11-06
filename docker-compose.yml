@@ -1,0 +1,11 @@
+services:
+  sample:
+    build: apps/sample-app
+    command: ["python", "sample.py"]
+
+  ci:
+    build:
+      context: .
+      dockerfile: Dockerfile.ci
+    volumes:
+      - .:/workspace:ro

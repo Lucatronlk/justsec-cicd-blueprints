@@ -1,0 +1,45 @@
+name: Sample - infrastructure
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sample-infrastructure-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/dev-security-scan.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/infrastructure
+      artifact-prefix: sample-infra-dev
+
+  pr:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/pr-security-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/infrastructure
+      artifact-prefix: sample-infra-pr
+
+  terraform:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/tf-security-scans.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/infrastructure
+      artifact-prefix: sample-infra-tf

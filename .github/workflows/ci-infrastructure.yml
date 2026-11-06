@@ -1,0 +1,70 @@
+# App-specific entrypoint: infrastructure. Image and full run only on manual dispatch.
+name: CI - infrastructure
+on:
+  push:
+    paths:
+      - 'apps/infrastructure/**'
+  pull_request:
+    paths:
+      - 'apps/infrastructure/**'
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Scan profile
+        type: choice
+        required: true
+        default: tf
+        options:
+          - tf
+          - pr
+          - full
+          - image
+permissions:
+  contents: read
+concurrency:
+  group: ci-infrastructure-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  tf:
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'tf') }}
+    uses: ./.github/workflows/profile-tf.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/infrastructure
+      artifact-prefix: infrastructure-tf
+      upload-sarif: false
+  pr:
+    if: ${{ github.event_name == 'pull_request' || (github.event_name == 'workflow_dispatch' && inputs.profile == 'pr') }}
+    uses: ./.github/workflows/profile-pr-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/infrastructure
+      artifact-prefix: infrastructure-pr
+      upload-sarif: false
+  full:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'full' }}
+    uses: ./.github/workflows/profile-full.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/infrastructure
+      artifact-prefix: infrastructure-full
+      upload-sarif: false
+      dockerfile: apps/infrastructure/Dockerfile
+      docker-context: apps/infrastructure
+  image:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'image' }}
+    uses: ./.github/workflows/profile-image.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      dockerfile: apps/infrastructure/Dockerfile
+      artifact-prefix: infrastructure-image
+      upload-sarif: false
+      docker-context: apps/infrastructure

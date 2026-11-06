@@ -1,0 +1,186 @@
+# Trivy over the repository's files: vulnerable dependencies, secrets and
+# misconfiguration (`fs`), or infrastructure as code alone (`config`).
+#
+# Call it from a repository with:
+#
+#   jobs:
+#     trivy:
+#       uses: Lucatronlk/justsec-cicd-blueprints/.github/workflows/scan-trivy.yml@<sha> # vX.Y.Z
+#       permissions:
+#         contents: read
+#         security-events: write
+#
+# Report-only: it never fails on a finding, only when the scanner itself
+# cannot run. The report is uploaded as an artifact for security-gate.yml,
+# which makes the one pass/fail decision (the profile-*.yml workflows wire
+# the two together). The scanner is pinned: a binary by version and SHA-256,
+# an image by digest. Values a caller passes reach the shell through env:.
+
+name: Scan - Trivy
+
+on:
+  workflow_call:
+    inputs:
+      working-directory:
+        description: "Directory to scan, relative to the repository root."
+        type: string
+        default: "."
+      artifact-name:
+        description: "Name of the artifact the report is uploaded as. Unique per workflow run; the gate downloads by prefix."
+        type: string
+        default: "scan-trivy"
+      retention-days:
+        description: "Days the report artifact is kept."
+        type: number
+        default: 14
+      upload-sarif:
+        description: "Upload SARIF to the repository's code scanning (needs a public repository or GitHub Advanced Security). The gate never depends on it."
+        type: boolean
+        default: true
+      egress-policy:
+        description: "harden-runner egress policy - `audit` logs outbound connections, `block` allows only `allowed-endpoints`."
+        type: string
+        default: "audit"
+      allowed-endpoints:
+        description: "harden-runner allow-list for `block`, space-separated host:port entries. The default is what this scan reaches; the runner's own infrastructure needs no entry."
+        type: string
+        default: "api.github.com:443 ghcr.io:443 github.com:443 mirror.gcr.io:443 objects.githubusercontent.com:443 pkg-containers.githubusercontent.com:443 release-assets.githubusercontent.com:443"
+      extra-allowed-endpoints:
+        description: "Appended to `allowed-endpoints`, for hosts only this repository needs. Same format."
+        type: string
+        default: ""
+      timeout-minutes:
+        description: "Job timeout."
+        type: number
+        default: 20
+      trivy-version:
+        description: "Trivy release to download (aquasecurity/trivy), without the `v`."
+        type: string
+        default: "0.75.0"
+      trivy-sha256:
+        description: "SHA-256 of the Trivy Linux-64bit tarball for that version."
+        type: string
+        default: "c6e65abddb348e25f10549df887045629cf28cc72453cd1c63acb717316b3f3f"
+      trivy-mode:
+        description: "`fs` scans files (dependencies, secrets, misconfiguration per `trivy-scanners`); `config` scans infrastructure as code only."
+        type: string
+        default: "fs"
+      trivy-scanners:
+        description: "Scanners for `fs` mode - any of `vuln,secret,misconfig,license`."
+        type: string
+        default: "vuln,secret,misconfig"
+      trivy-ignore-unfixed:
+        description: "Leave out vulnerabilities with no fixed version."
+        type: boolean
+        default: false
+      trivy-args:
+        description: "Extra Trivy arguments, e.g. `--skip-dirs tests`."
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  scan:
+    name: trivy
+    runs-on: ubuntu-24.04
+    timeout-minutes: ${{ inputs.timeout-minutes }}
+    permissions:
+      contents: read
+      security-events: write  # the SARIF upload, a view in the Security tab
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: ${{ inputs.egress-policy }}
+          allowed-endpoints: ${{ inputs.allowed-endpoints }} ${{ inputs.extra-allowed-endpoints }}
+          # The agent may only stop reporting to StepSecurity in block mode.
+          disable-telemetry: ${{ inputs.egress-policy == 'block' }}
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Print checkout and scan-path diagnostics
+        env:
+          DIR: ${{ inputs.working-directory }}
+        run: |
+          set -euo pipefail
+          printf 'pwd=%s\nGITHUB_WORKSPACE=%s\nGITHUB_SHA=%s\n' "$PWD" "$GITHUB_WORKSPACE" "$GITHUB_SHA"
+          printf 'git_top_level=%s\nchecked_out_head=%s\n' "$(git rev-parse --show-toplevel)" "$(git rev-parse HEAD)"
+          printf 'scan_directory=%s\n' "$DIR"
+          if [ -d "$DIR" ]; then
+            printf 'scan_directory_present=true\n'
+          else
+            printf '::error::Missing scan directory: %s\n' "$DIR"
+            exit 1
+          fi
+
+      - name: Install trivy at the pinned version
+        env:
+          VERSION: ${{ inputs.trivy-version }}
+          SHA256: ${{ inputs.trivy-sha256 }}
+        run: |
+          set -euo pipefail
+          curl -sSfL -o /tmp/trivy.download "https://github.com/aquasecurity/trivy/releases/download/v${VERSION}/trivy_${VERSION}_Linux-64bit.tar.gz"
+          echo "${SHA256}  /tmp/trivy.download" | sha256sum -c -
+          tar -xzf /tmp/trivy.download -C /tmp trivy
+          mkdir -p "$RUNNER_TEMP/trivy-bin"
+          install -m 0755 /tmp/trivy "$RUNNER_TEMP/trivy-bin/trivy"
+          echo "$RUNNER_TEMP/trivy-bin" >> "$GITHUB_PATH"
+          "$RUNNER_TEMP/trivy-bin/trivy" --version
+
+      - name: Prepare the report directories
+        run: mkdir -p "$RUNNER_TEMP/scan-results" "$RUNNER_TEMP/sarif"
+
+      - name: trivy
+        env:
+          MODE: ${{ inputs.trivy-mode }}
+          SCANNERS: ${{ inputs.trivy-scanners }}
+          UNFIXED: ${{ inputs.trivy-ignore-unfixed }}
+          DIR: ${{ inputs.working-directory }}
+          ARGS: ${{ inputs.trivy-args }}
+        run: |
+          set -euo pipefail
+          read -r -a args <<< "$ARGS"
+          if [ "$UNFIXED" = "true" ]; then args+=(--ignore-unfixed); fi
+          out="$RUNNER_TEMP/scan-results/trivy-$MODE.json"
+          case "$MODE" in
+            fs) trivy fs --quiet --scanners "$SCANNERS" --format json --output "$out" --exit-code 0 "${args[@]}" "$DIR" ;;
+            config) trivy config --quiet --format json --output "$out" --exit-code 0 "${args[@]}" "$DIR" ;;
+            *) echo "::error::trivy-mode must be fs or config, got '$MODE'"; exit 2 ;;
+          esac
+          trivy convert --format sarif --output "$RUNNER_TEMP/sarif/trivy.sarif" "$out"
+
+      - name: Upload the report for the gate
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ inputs.artifact-name }}
+          path: ${{ runner.temp }}/scan-results/
+          if-no-files-found: error
+          retention-days: ${{ inputs.retention-days }}
+
+      # hashFiles() only sees the workspace, so presence is checked here.
+      - name: Find the SARIF files
+        id: sarif
+        if: inputs.upload-sarif
+        run: |
+          set -euo pipefail
+          for f in "$RUNNER_TEMP"/sarif/*.sarif; do
+            [ -s "$f" ] || continue
+            name=$(basename "$f" .sarif)
+            echo "${name//-/_}=true" >> "$GITHUB_OUTPUT"
+          done
+
+      # A view in the Security tab, not the decision: a private repository
+      # without Advanced Security, or a fork's pull request, cannot upload,
+      # and the gate does not need it to.
+
+      - name: Upload SARIF (trivy.sarif)
+        if: inputs.upload-sarif && steps.sarif.outputs.trivy == 'true'
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@6f2ac81f5cd81fe351a197ba0b00d91d03cd2aee # v4.39.0
+        with:
+          sarif_file: ${{ runner.temp }}/sarif/trivy.sarif
+          category: ${{ inputs.artifact-name }}

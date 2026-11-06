@@ -1,0 +1,15 @@
+# Findings the security gate is told to accept, read by security-gate.yml.
+#
+# Every entry needs all four of id, reason, owner and expires; an incomplete
+# entry fails the gate, and an expired one stops applying (the finding blocks
+# again). Optional: `tool` (report name prefix, e.g. trivy) and `path` (glob on
+# the finding's location). `id` is a glob too, e.g. CVE-2026-1234 or CKV_AWS_*.
+#
+#   exceptions:
+#     - id: CVE-2026-1234
+#       tool: trivy
+#       path: "apps/fixture/*"
+#       reason: Not reachable - the vulnerable function is never called.
+#       owner: Lucatronlk
+#       expires: 2026-12-31
+exceptions: []

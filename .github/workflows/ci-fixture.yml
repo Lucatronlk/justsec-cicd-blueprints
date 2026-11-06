@@ -1,0 +1,64 @@
+# App-specific entrypoint: fixture. Image and full run only on manual dispatch.
+name: CI - fixture
+on:
+  workflow_dispatch:
+    inputs:
+      profile:
+        description: Scan profile
+        type: choice
+        required: true
+        default: dev
+        options:
+          - dev
+          - pr
+          - full
+          - image
+permissions:
+  contents: read
+concurrency:
+  group: ci-fixture-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  dev:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'dev' }}
+    uses: ./.github/workflows/profile-dev.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/fixture
+      artifact-prefix: fixture-dev
+      upload-sarif: false
+  pr:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'pr' }}
+    uses: ./.github/workflows/profile-pr-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/fixture
+      artifact-prefix: fixture-pr
+      upload-sarif: false
+  full:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'full' }}
+    uses: ./.github/workflows/profile-full.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: apps/fixture
+      artifact-prefix: fixture-full
+      upload-sarif: false
+      dockerfile: apps/fixture/Dockerfile
+      docker-context: apps/fixture
+  image:
+    if: ${{ github.event_name == 'workflow_dispatch' && inputs.profile == 'image' }}
+    uses: ./.github/workflows/profile-image.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      dockerfile: apps/fixture/Dockerfile
+      artifact-prefix: fixture-image
+      upload-sarif: false
+      docker-context: apps/fixture

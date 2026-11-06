@@ -1,0 +1,5 @@
+# actionlint knows GitHub's hosted labels only. This repository uses hosted
+# runners, so the list is empty; declare any custom label here if you add a
+# self-hosted runner, and a test enforces that the two stay in sync.
+self-hosted-runner:
+  labels: []

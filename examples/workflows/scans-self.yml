@@ -1,0 +1,103 @@
+# The scan profiles run on this repository, at the pull request's own ref,
+# against the fixture project: every scan-*.yml through a profile, and the
+# gate deciding each, so a change to a scan, a profile or the gate is
+# exercised here before a caller pins it. `Scans green` is the one check
+# branch protection names.
+#
+# The fixture is clean on purpose: a finding here is a regression in the
+# fixture or a scanner change worth reading, and the gate says which.
+# Dependency-Check runs only when an NVD key is configured (see README).
+name: Scans
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  pr-gate:
+    uses: ./.github/workflows/profile-pr-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # the profiles' SARIF uploads
+    with:
+      working-directory: apps/fixture
+
+  dev:
+    uses: ./.github/workflows/profile-dev.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # the profiles' SARIF uploads
+    with:
+      working-directory: apps/fixture
+
+  secrets:
+    uses: ./.github/workflows/profile-secrets.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # the profiles' SARIF uploads
+    with:
+      artifact-prefix: secrets
+
+  tf:
+    uses: ./.github/workflows/profile-tf.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # the profiles' SARIF uploads
+    with:
+      working-directory: apps/fixture/tofu
+
+  image:
+    uses: ./.github/workflows/profile-image.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # the profiles' SARIF uploads
+    with:
+      dockerfile: apps/fixture/Dockerfile
+      docker-context: apps/fixture
+
+  full:
+    uses: ./.github/workflows/profile-full.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # the profiles' SARIF uploads
+    secrets:
+      NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+    with:
+      working-directory: apps/fixture
+      dockerfile: apps/fixture/Dockerfile
+      docker-context: apps/fixture
+      dependency-check: ${{ vars.DEPENDENCY_CHECK == 'true' }}
+
+  scans-green:
+    name: Scans green
+    if: always()
+    needs: [pr-gate, dev, secrets, tf, image, full]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - uses: step-security/harden-runner@ccd8616d44fd3846e67624a50d5aad6d37bf2d25 # v2.22.1
+        with:
+          egress-policy: audit
+
+      - name: Every profile passed
+        env:
+          RESULTS: ${{ toJSON(needs) }}
+        run: |
+          set -euo pipefail
+          echo "$RESULTS"
+          if echo "$RESULTS" | grep -Eq '"result": "(failure|cancelled)"'; then
+            echo "::error::a profile's gate failed"
+            exit 1
+          fi

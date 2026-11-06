@@ -1,0 +1,25 @@
+# Run the reusable shell CI over every tracked shell script in this repository.
+# bash-ci discovers .sh/.bash files and shell shebangs with git ls-files.
+name: Sample - all Bash scripts
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sample-bash-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  shell:
+    uses: ./.github/workflows/bash-ci.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+    with:
+      paths: "."
+      shfmt-args: -i 2 -ci
+      workflow-lint: false # ci.yml already runs actionlint and zizmor on PRs/main

@@ -1,0 +1,31 @@
+# Optional image for a self-hosted runner. Every workflow currently runs on
+# GitHub-hosted `ubuntu-24.04`, so this is only needed when moving jobs to your
+# own hardware; it is the container the runner process runs in.
+#
+# Build: docker build -f Dockerfile.runner -t runner:local .
+# Then give the container a daemon, either the host socket (DooD) or a
+# `docker:dind` sidecar; only the CLI is installed here.
+FROM ghcr.io/actions/actions-runner:latest@sha256:759a1d94a15b05941aba5196974ff43fe15b4cbba29b694b35cbc32a1166b232
+
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
+
+# docker CLI for every `docker run`/`docker build` step
+# python3 for scripts/*.py, yq for security-gate, jq for scan payloads.
+ARG DEBIAN_FRONTEND=noninteractive
+ARG YQ_VERSION=v4.47.1
+ARG YQ_SHA256=0fb28c6680193c41b364193d0c0fc4a03177aecde51cfc04d506b1517158c2fb
+
+# hadolint ignore=DL3066
+USER root
+# hadolint ignore=DL3008
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends ca-certificates curl docker.io jq python3 \
+    && curl -fsSL -o /usr/local/bin/yq \
+        "https://github.com/mikefarah/yq/releases/download/${YQ_VERSION}/yq_linux_amd64" \
+    && printf '%s  %s\n' "${YQ_SHA256}" /usr/local/bin/yq | sha256sum -c - \
+    && chmod 0755 /usr/local/bin/yq \
+    && rm -rf /var/lib/apt/lists/*
+
+# runner:runner in the base image; numeric so a host GID mapping stays explicit.
+# hadolint ignore=DL3066
+USER 1001:1001

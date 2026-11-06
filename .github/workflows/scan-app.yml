@@ -1,0 +1,91 @@
+# One selected target and depth. All scanner artifacts are evaluated by their profile gate.
+name: Scan selected app
+on:
+  workflow_call:
+    inputs:
+      app:
+        required: true
+        type: string
+      path:
+        required: true
+        type: string
+      artifact-prefix:
+        required: true
+        type: string
+      depth:
+        required: true
+        type: string
+      dockerfile:
+        type: string
+        default: ''
+      context:
+        type: string
+        default: '.'
+permissions:
+  contents: read
+jobs:
+  minimum:
+    if: inputs.depth == 'minimum'
+    uses: ./.github/workflows/scan-trivy.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: ${{ inputs.path }}
+      artifact-name: ${{ inputs.artifact-prefix }}-trivy
+      trivy-scanners: vuln,secret,misconfig
+      upload-sarif: false
+  minimum-gate:
+    if: ${{ always() && inputs.depth == 'minimum' }}
+    needs: [minimum]
+    uses: ./.github/workflows/security-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+    with:
+      artifact-prefix: ${{ inputs.artifact-prefix }}
+      upstream-results: ${{ join(needs.*.result, ',') }}
+      expected-reports: trivy-fs
+  pr:
+    if: inputs.depth == 'pr'
+    uses: ./.github/workflows/profile-pr-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: ${{ inputs.path }}
+      artifact-prefix: ${{ inputs.artifact-prefix }}
+      upload-sarif: false
+  full:
+    if: inputs.depth == 'full'
+    uses: ./.github/workflows/profile-full.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write # SARIF upload to the Security tab needs it.
+    with:
+      working-directory: ${{ inputs.path }}
+      artifact-prefix: ${{ inputs.artifact-prefix }}
+      dockerfile: ${{ inputs.dockerfile }}
+      docker-context: ${{ inputs.context }}
+      upload-sarif: false
+  result:
+    name: App scan result
+    if: always()
+    needs: [minimum, minimum-gate, pr, full]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Require selected depth to pass
+        env:
+          DEPTH: ${{ inputs.depth }}
+          MINIMUM: ${{ needs.minimum-gate.result }}
+          PR: ${{ needs.pr.result }}
+          FULL: ${{ needs.full.result }}
+        run: |
+          set -euo pipefail
+          case "$DEPTH" in
+            minimum) test "$MINIMUM" = success ;;
+            pr) test "$PR" = success ;;
+            full) test "$FULL" = success ;;
+            *) echo '::error::Invalid depth'; exit 1 ;;
+          esac

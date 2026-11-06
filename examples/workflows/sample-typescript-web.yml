@@ -1,0 +1,46 @@
+name: Sample - TypeScript web
+
+on:
+  push:
+    branches-ignore: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sample-typescript-web-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  dev:
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/dev-security-scan.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/typescript-web
+      artifact-prefix: sample-typescript-dev
+
+  pr:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/pr-security-gate.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      working-directory: apps/typescript-web
+      artifact-prefix: sample-typescript-pr
+
+  image:
+    if: github.event_name == 'pull_request' || github.event_name == 'workflow_dispatch'
+    uses: ./.github/workflows/image-security-scan.yml # zizmor: ignore[self-repository]
+    permissions:
+      contents: read
+      security-events: write  # nested scanner requests SARIF scope even when upload-sarif is false
+    with:
+      dockerfile: apps/typescript-web/Dockerfile
+      docker-context: apps/typescript-web
+      artifact-prefix: sample-typescript-image
